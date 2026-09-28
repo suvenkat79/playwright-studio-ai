@@ -1,0 +1,23 @@
+{
+  "name": "playwright-studio-recorder",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Visible Chromium Playwright recording engine compiled for Spring Boot ProcessBuilder",
+  "main": "dist/cli.js",
+  "scripts": {
+    "build": "esbuild cli.ts --bundle --platform=node --format=esm --outfile=dist/cli.js --packages=external",
+    "cli": "node dist/cli.js"
+  },
+  "dependencies": {
+    "playwright": "^1.50.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.14.0",
+    "esbuild": "^0.25.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.7.0"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}
