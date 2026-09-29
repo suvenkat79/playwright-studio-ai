@@ -34,12 +34,12 @@ export const StickyActionBar: React.FC<StickyActionBarProps> = ({
           onClick={onRunSandbox}
           className="h-10 px-3.5 rounded-lg bg-[#1c2028] hover:bg-[#262a33] text-[#dfe2ee] border border-[#262a33] flex items-center justify-center gap-1.5 text-xs sm:text-sm font-medium transition-colors active:scale-[0.98] cursor-pointer"
           id="runSandboxBtn"
-          title="Run in Sandbox"
+          title="Execute in Sandbox"
         >
           <span className="material-symbols-outlined text-[18px] text-[#4cd7f6]">
             play_circle
           </span>
-          <span className="hidden sm:inline">Sandbox</span>
+          <span className="hidden sm:inline">Execute</span>
         </button>
 
         <button
