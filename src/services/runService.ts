@@ -1,7 +1,7 @@
 import { apiClient } from './api';
 import { RunExecuteRequest, RunExecuteResponse, RunEventsResponse, RunHistoryEntry } from '../types';
 
-export const RUN_API_BASE_URL = 'http://localhost:8099';
+export const RUN_API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8099';
 
 /**
  * Real Playwright Test Execution Engine API client.

@@ -8,7 +8,7 @@ import {
   SessionStatusResponse
 } from '../types';
 
-export const RECORD_API_BASE_URL = 'http://localhost:8099';
+export const RECORD_API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8099';
 
 /**
  * Reusable Recording API Service

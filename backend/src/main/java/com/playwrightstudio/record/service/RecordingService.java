@@ -65,11 +65,17 @@ public class RecordingService {
 
         try {
             // Build child process to run: node recorder/dist/cli.js --url <url> --session <sessionId>
-            ProcessBuilder pb = new ProcessBuilder(
+            List<String> command = new ArrayList<>(List.of(
                 "node", recorderScriptPath,
                 "--url", url,
                 "--session", sessionId
-            );
+            ));
+            if (shouldRunHeadless()) {
+                log.info("[RecordingService] No display detected on this Linux host; launching recorder with --headless");
+                command.add("--headless");
+            }
+
+            ProcessBuilder pb = new ProcessBuilder(command);
             pb.directory(workingDir);
 
             // Set environment to ensure visible display / PATH
@@ -303,5 +309,18 @@ public class RecordingService {
      */
     private File resolveProjectRoot() {
         return ProjectPaths.resolveProjectRoot();
+    }
+
+    /**
+     * True on a Linux host with no DISPLAY (e.g. a cloud VM), where a headed
+     * Chromium launch would fail. macOS/Windows always have a native display,
+     * so they stay headed for local debugging even though DISPLAY is unset there.
+     */
+    private boolean shouldRunHeadless() {
+        String osName = System.getProperty("os.name", "").toLowerCase();
+        boolean isLinux = osName.contains("nux") || osName.contains("nix");
+        String display = System.getenv("DISPLAY");
+        boolean hasDisplay = display != null && !display.isBlank();
+        return isLinux && !hasDisplay;
     }
 }

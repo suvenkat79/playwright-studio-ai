@@ -27,7 +27,7 @@ export default function App() {
   const [activeNavTab, setActiveNavTab] = useState<NavigationTab>('projects');
   const [activeCategoryTab, setActiveCategoryTab] = useState<CategorySubTab>('pom');
   const [currentProject, setCurrentProject] = useState('core-e2e / Projects');
-  const [targetBaseUrl, setTargetBaseUrl] = useState<string>('https://www.awwwards.com/websites/e-commerce/');
+  const [targetBaseUrl, setTargetBaseUrl] = useState<string>('https://www.amazon.in');
   const [isHeadless, setIsHeadless] = useState<boolean>(false); // Headed mode (headless: false) by default
   const [suiteFiles, setSuiteFiles] = useState<SuiteFile[]>(INITIAL_SUITE_FILES);
   const [activeFileId, setActiveFileId] = useState<string>('AwwwardsEcommercePage.ts');
