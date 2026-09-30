@@ -21,6 +21,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.UUID;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -51,10 +52,23 @@ public class RunService {
 
     public RunExecuteResponse executeRun(RunExecuteRequest request) {
         String browser = normalizeBrowser(request.getBrowser());
-        String specName = sanitizeFileName(request.getSpecName(), "suite.spec.ts");
-        String pomName = request.getPomContent() != null && !request.getPomContent().isBlank()
+
+        // Sprint 4: a single self-contained optimized spec (request.getSpec())
+        // takes priority over the legacy specName/specContent pair — the
+        // Optimizer's PlaywrightGenerator never produces a separate POM, so
+        // there's nothing to look up a pomName for in that case.
+        boolean usingDirectSpec = request.getSpec() != null && !request.getSpec().isBlank();
+        String specName = usingDirectSpec
+                ? sanitizeFileName(request.getSpecName(), "optimized.spec.ts")
+                : sanitizeFileName(request.getSpecName(), "suite.spec.ts");
+        String effectiveSpecContent = usingDirectSpec ? request.getSpec() : request.getSpecContent();
+        String pomName = !usingDirectSpec && request.getPomContent() != null && !request.getPomContent().isBlank()
                 ? sanitizeFileName(request.getPomName(), "PageObject.ts")
                 : null;
+
+        // headed (Sprint 4) and headless (legacy) describe the same concept
+        // inverted — headed wins when the caller supplies it.
+        boolean effectiveHeadless = request.getHeaded() != null ? !request.getHeaded() : request.isHeadless();
 
         String runId = "run_" + System.currentTimeMillis() + "_" + UUID.randomUUID().toString().substring(0, 5);
         int runNumber = runSessionManager.nextRunNumber();
@@ -62,7 +76,7 @@ public class RunService {
         File projectRoot = ProjectPaths.resolveProjectRoot();
         File workspaceDir = new File(projectRoot, "run-workspace/" + runId);
 
-        RunSession session = new RunSession(runId, runNumber, specName, browser, request.isHeadless(), workspaceDir);
+        RunSession session = new RunSession(runId, runNumber, specName, browser, effectiveHeadless, workspaceDir);
         runSessionManager.registerSession(session);
 
         try {
@@ -74,11 +88,11 @@ public class RunService {
             if (pomName != null) {
                 writeFile(new File(testsDir, pomName), rewriteImports(request.getPomContent()));
             }
-            writeFile(new File(testsDir, specName), rewriteImports(request.getSpecContent()));
+            writeFile(new File(testsDir, specName), rewriteImports(effectiveSpecContent));
 
             File reporterScript = new File(projectRoot, "recorder/runReporter.ts");
             File configFile = new File(workspaceDir, "playwright.config.ts");
-            writeFile(configFile, buildConfig(browser, request.isHeadless(), reporterScript));
+            writeFile(configFile, buildConfig(browser, effectiveHeadless, reporterScript));
 
             // Report paths are deterministic from the config we just wrote —
             // no need to wait for RUN_FINISHED to know where they'll land.
@@ -88,7 +102,7 @@ public class RunService {
             paths.setJunitXmlPath(new File(resultsDir, "junit.xml").getAbsolutePath());
 
             log.info("[RunService] Spawning Playwright run {} (#{}) for spec: {} [{}, headless={}]",
-                    runId, runNumber, specName, browser, request.isHeadless());
+                    runId, runNumber, specName, browser, effectiveHeadless);
 
             ProcessBuilder pb = new ProcessBuilder(
                     "npx", "playwright", "test",
@@ -97,9 +111,46 @@ public class RunService {
             );
             pb.directory(projectRoot);
 
+            // Execution-time credential injection (never logged, never persisted,
+            // never written to any file, never echoed back in any response).
+            // Values live only in this request object and the child process's
+            // own environment — discarded the moment the process exits.
+            // Sprint 4's named baseUrl/username/password fields are merged in
+            // as BASE_URL/APP_USERNAME/APP_PASSWORD alongside (and overriding,
+            // if both are somehow present) the legacy generic credentials map.
+            Map<String, String> credentials = new java.util.HashMap<>();
+            if (request.getCredentials() != null) {
+                credentials.putAll(request.getCredentials());
+            }
+            if (request.getBaseUrl() != null && !request.getBaseUrl().isBlank()) {
+                credentials.put("BASE_URL", request.getBaseUrl());
+            }
+            if (request.getUsername() != null && !request.getUsername().isBlank()) {
+                credentials.put("APP_USERNAME", request.getUsername());
+            }
+            if (request.getPassword() != null && !request.getPassword().isBlank()) {
+                credentials.put("APP_PASSWORD", request.getPassword());
+            }
+
+            if (!credentials.isEmpty()) {
+                for (Map.Entry<String, String> entry : credentials.entrySet()) {
+                    if (entry.getKey() != null && entry.getValue() != null) {
+                        pb.environment().put(entry.getKey(), entry.getValue());
+                    }
+                }
+                session.addLog("[RUNNER] Injected " + credentials.size() + " credential environment variable(s).");
+            }
+
             session.addLog("$ npx playwright test " + specName + " --project=" + browser
-                    + (request.isHeadless() ? "" : " --headed"));
+                    + (effectiveHeadless ? "" : " --headed"));
             session.addLog("[RUNNER] Workspace: " + workspaceDir.getAbsolutePath());
+
+            // TEMPORARY debug logging (Execute pipeline investigation) — presence
+            // only, never values. Safe to leave in server logs; remove once the
+            // pipeline is confirmed healthy.
+            log.info("[RunService][DEBUG] BASE_URL present: {}", pb.environment().containsKey("BASE_URL"));
+            log.info("[RunService][DEBUG] APP_USERNAME present: {}", pb.environment().containsKey("APP_USERNAME"));
+            log.info("[RunService][DEBUG] APP_PASSWORD present: {}", pb.environment().containsKey("APP_PASSWORD"));
 
             Process process = pb.start();
             session.setProcess(process);
@@ -459,6 +510,29 @@ public class RunService {
             default -> "Desktop Chrome";
         };
 
+        // Leaner Chromium instance — reduces memory footprint in both headed
+        // and headless mode, independent of that choice. Added after live
+        // runs on this machine crashed mid-test under high swap usage
+        // (system memory pressure, not a test-logic bug). Chromium-only:
+        // `channel: 'chromium'` and these --disable-* flags are Chromium
+        // launch options: Firefox/WebKit use an entirely different flag
+        // syntax and would error on them, so this is omitted for those runs.
+        String launchOptions = "chromium".equals(browser)
+            ? """
+                    launchOptions: {
+                      channel: 'chromium',
+                      args: [
+                        '--disable-extensions',
+                        '--disable-background-networking',
+                        '--disable-sync',
+                        '--disable-default-apps',
+                        '--no-first-run',
+                        '--disable-dev-shm-usage'
+                      ]
+                    },
+              """
+            : "";
+
         return """
                 import { defineConfig, devices } from 'playwright/test';
 
@@ -466,8 +540,18 @@ public class RunService {
                 // Not hand-edited — regenerated fresh on every run.
                 export default defineConfig({
                   testDir: './tests',
-                  timeout: 30 * 1000,
-                  expect: { timeout: 5000 },
+                  // Overall per-test budget. 30s was tuned for short demo
+                  // flows; a real multi-step recorded journey (login + several
+                  // navigations) against a live remote backend — especially
+                  // enterprise apps like ServiceNow/SAP/Salesforce classic UI,
+                  // which are well known to be slower than typical modern
+                  // SPAs — can easily need more, particularly when a
+                  // destination page's content renders inside an iframe
+                  // (e.g. ServiceNow's list views) separately from the outer
+                  // page's own URL/load event. 120s gives realistic headroom
+                  // without being unbounded.
+                  timeout: 120 * 1000,
+                  expect: { timeout: 10000 },
                   fullyParallel: false,
                   retries: 0,
                   workers: 1,
@@ -479,10 +563,14 @@ public class RunService {
                   ],
                   use: {
                     headless: %s,
+                    // Bound individual interactions so a stale or unavailable
+                    // recorded locator fails clearly instead of appearing hung.
+                    actionTimeout: 20 * 1000,
+                    navigationTimeout: 30 * 1000,
                     trace: 'on',
                     screenshot: 'on',
-                    video: 'retain-on-failure'
-                  },
+                    video: 'retain-on-failure',
+                %s  },
                   projects: [
                     {
                       name: '%s',
@@ -493,6 +581,6 @@ public class RunService {
                     }
                   ]
                 });
-                """.formatted(reporterPath, headless, browser, deviceName, headless);
+                """.formatted(reporterPath, headless, launchOptions, browser, deviceName, headless);
     }
 }

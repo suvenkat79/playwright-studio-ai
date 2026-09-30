@@ -32,7 +32,9 @@ public class RunController {
      */
     @PostMapping("/execute")
     public ResponseEntity<RunExecuteResponse> executeRun(@RequestBody RunExecuteRequest request) {
-        if (request.getSpecContent() == null || request.getSpecContent().isBlank()) {
+        boolean hasLegacyContent = request.getSpecContent() != null && !request.getSpecContent().isBlank();
+        boolean hasDirectSpec = request.getSpec() != null && !request.getSpec().isBlank();
+        if (!hasLegacyContent && !hasDirectSpec) {
             return ResponseEntity.badRequest().build();
         }
 

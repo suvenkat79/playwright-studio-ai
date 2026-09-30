@@ -1,6 +1,9 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { RecordedAction, NavigationTab } from '../types';
+import { RecordedAction, NavigationTab, RunLifecycleStatus } from '../types';
 import { useRecording } from '../context/RecordingContext';
+import { optimizeRecordedActions, generateOptimizedSpec } from '../services/optimizerService';
+import { runService } from '../services/runService';
+import { CredentialManagerModal, CredentialManagerValues } from './CredentialManagerModal';
 
 /**
  * Formats elapsed seconds into MM:SS or HH:MM:SS display string
@@ -118,7 +121,11 @@ export const LiveRecorderView: React.FC<LiveRecorderViewProps> = ({
   const [activePreset, setActivePreset] = useState<AppPresetType>('incident');
   const [targetUrl, setTargetUrl] = useState('https://core-e2e.internal.corp/incidents/new');
   const [inputUrl, setInputUrl] = useState('https://core-e2e.internal.corp/incidents/new');
-  const [isRecording, setIsRecording] = useState(true);
+  const [isRecording, setIsRecording] = useState(false);
+  const isRecorderActive = sessionId
+    ? sessionLifecycleStatus === 'RUNNING'
+    : isRecording;
+  const isRecorderStopping = isStopping || sessionLifecycleStatus === 'STOPPING';
 
   // Sync with context recorded URL if set
   useEffect(() => {
@@ -130,10 +137,20 @@ export const LiveRecorderView: React.FC<LiveRecorderViewProps> = ({
     }
   }, [recordedUrl]);
 
+  useEffect(() => {
+    if (sessionLifecycleStatus === 'STOPPED' || sessionLifecycleStatus === 'FAILED') {
+      setIsRecording(false);
+    }
+  }, [sessionLifecycleStatus]);
+
   // Sync real-time captured events from active browser recording session
   useEffect(() => {
     if (capturedEvents && capturedEvents.length > 0) {
       setRecordedActions(capturedEvents);
+      // A newly-arrived raw event invalidates any previously optimized
+      // output — it was derived from a different (now stale) snapshot.
+      setOptimizedScript(null);
+      setOptimizedStepCount(null);
     }
   }, [capturedEvents]);
 
@@ -201,6 +218,11 @@ export const LiveRecorderView: React.FC<LiveRecorderViewProps> = ({
 
   const [hoveredElement, setHoveredElement] = useState<string | null>(null);
   const [copiedCode, setCopiedCode] = useState(false);
+  const [optimizedScript, setOptimizedScript] = useState<string | null>(null);
+  const [optimizedStepCount, setOptimizedStepCount] = useState<number | null>(null);
+  const [isCredentialModalOpen, setIsCredentialModalOpen] = useState(false);
+  const [executeRunId, setExecuteRunId] = useState<string | null>(null);
+  const [executeStatus, setExecuteStatus] = useState<RunLifecycleStatus | null>(null);
 
   const addAction = (
     type: 'click' | 'fill' | 'select' | 'assert',
@@ -265,6 +287,7 @@ export const LiveRecorderView: React.FC<LiveRecorderViewProps> = ({
   const handleStopRecordingSession = async () => {
     try {
       const res = await stopRecording();
+      setIsRecording(false);
       onToast?.(
         `Recording stopped. Captured ${res?.totalEvents ?? recordedActions.length} browser actions.`,
         'info'
@@ -298,9 +321,30 @@ export const LiveRecorderView: React.FC<LiveRecorderViewProps> = ({
     setOrderPlaced(false);
     setMemberInvited(false);
     setCustomActionTriggered(false);
+    setOptimizedScript(null);
+    setOptimizedStepCount(null);
   };
 
-  const generatedScript =
+  /** Runs the Optimizer Pipeline against the current recorded events and
+   * replaces the displayed Generated Playwright Spec with its output.
+   * Never touches recordedActions/capturedEvents — the original recorded
+   * events are left exactly as they are. */
+  const handleOptimize = () => {
+    if (recordedActions.length === 0) {
+      onToast?.('Please record some actions before optimizing.', 'info');
+      return;
+    }
+    const optimized = optimizeRecordedActions(recordedActions);
+    const spec = generateOptimizedSpec(optimized, targetUrl);
+    setOptimizedScript(spec);
+    setOptimizedStepCount(optimized.length);
+    onToast?.(
+      `Optimized ${recordedActions.length} recorded event(s) into ${optimized.length} step(s).`,
+      'success'
+    );
+  };
+
+  const rawGeneratedScript =
     lastGeneratedScript ||
     `import { test, expect } from '@playwright/test';
 
@@ -316,6 +360,86 @@ ${
 }
 });`;
 
+  const generatedScript = optimizedScript || rawGeneratedScript;
+
+  /** Execute entry point: always confirms credentials/environment via the
+   * Credential Manager modal before launching a run of the currently
+   * displayed Generated Playwright Spec (optimized, if available). */
+  const handleExecuteClick = () => {
+    if (recordedActions.length === 0) {
+      onToast?.('Please record some actions before executing.', 'info');
+      return;
+    }
+    if (!optimizedScript) {
+      const optimized = optimizeRecordedActions(recordedActions);
+      setOptimizedScript(generateOptimizedSpec(optimized, targetUrl));
+      setOptimizedStepCount(optimized.length);
+    }
+    setIsCredentialModalOpen(true);
+  };
+
+  const handleCredentialCancel = () => setIsCredentialModalOpen(false);
+
+  const handleCredentialConfirm = async (values: CredentialManagerValues) => {
+    setIsCredentialModalOpen(false);
+    setExecuteRunId(null);
+    setExecuteStatus('RUNNING');
+    try {
+      const response = await runService.startRun({
+        spec: generatedScript,
+        baseUrl: values.baseUrl,
+        username: values.username,
+        password: values.password,
+        browser: values.browser,
+        headed: values.headed,
+        headless: !values.headed,
+        credentials: {
+          BASE_URL: values.baseUrl,
+          APP_USERNAME: values.username,
+          APP_PASSWORD: values.password
+        }
+      });
+      setExecuteRunId(response.runId);
+      onToast?.(`Execution started — run #${response.runNumber}.`, 'info');
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Failed to start Playwright run';
+      setExecuteStatus('ERROR');
+      onToast?.(`Failed to start execution: ${message}`, 'error');
+    }
+  };
+
+  // Poll the real Playwright run until it reaches a terminal status, then
+  // surface the result as a toast — mirrors SandboxRunnerModal's own
+  // polling pattern against the same RunController#getRunEvents endpoint.
+  useEffect(() => {
+    if (!executeRunId || executeStatus !== 'RUNNING') return;
+    let cancelled = false;
+
+    const poll = async () => {
+      try {
+        const data = await runService.getRunEvents(executeRunId);
+        if (cancelled) return;
+        if (data.status !== 'RUNNING') {
+          setExecuteStatus(data.status);
+          if (data.status === 'PASSED') {
+            onToast?.(`Execution passed in ${data.totalDurationMs}ms.`, 'success');
+          } else {
+            onToast?.(`Execution ${data.status.toLowerCase()}${data.failureReason ? `: ${data.failureReason}` : ''}`, 'error');
+          }
+        }
+      } catch (pollErr) {
+        console.debug('[LiveRecorderView] Execute poll debug:', pollErr);
+      }
+    };
+
+    poll();
+    const interval = setInterval(poll, 700);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [executeRunId, executeStatus]);
+
   const handleCopyCode = () => {
     navigator.clipboard.writeText(generatedScript);
     setCopiedCode(true);
@@ -328,23 +452,44 @@ ${
       <div className="bg-[#181c24] p-3 sm:p-4 rounded-xl border border-[#262a33] flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2 flex-wrap">
           <button
-            onClick={() => setIsRecording(!isRecording)}
+            onClick={() => {
+              if (!sessionId) setIsRecording(!isRecording);
+            }}
+            disabled={Boolean(sessionId) || isRecorderStopping}
             className={`px-3 py-1.5 rounded-lg text-xs font-semibold font-mono flex items-center gap-1.5 transition-all cursor-pointer ${
-              isRecording
+              isRecorderActive
                 ? 'bg-[#ffb4ab]/20 text-[#ffb4ab] border border-[#ffb4ab]/40 animate-pulse'
                 : 'bg-[#262a33] text-[#c7c4d7] hover:text-[#dfe2ee]'
-            }`}
+            } disabled:cursor-default disabled:opacity-100`}
           >
             <span className="material-symbols-outlined text-[16px]">
-              {isRecording ? 'radio_button_checked' : 'play_arrow'}
+              {isRecorderStopping
+                ? 'progress_activity'
+                : isRecorderActive
+                ? 'radio_button_checked'
+                : 'play_arrow'}
             </span>
-            <span>{isRecording ? 'RECORDING ACTIVE' : 'RECORDER PAUSED'}</span>
+            <span>
+              {isRecorderStopping
+                ? 'STOPPING'
+                : isRecorderActive
+                ? 'RECORDING ACTIVE'
+                : 'RECORDER PAUSED'}
+            </span>
           </button>
 
           {/* Session ID Badge from Context */}
           {sessionId && (
             <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-[#0566d9]/20 border border-[#4cd7f6]/40 text-xs font-mono">
-              <span className="w-2 h-2 rounded-full bg-[#10b981] animate-pulse"></span>
+              <span
+                className={`w-2 h-2 rounded-full ${
+                  isRecorderActive
+                    ? 'bg-[#10b981] animate-pulse'
+                    : isRecorderStopping
+                    ? 'bg-amber-400 animate-pulse'
+                    : 'bg-[#908fa0]'
+                }`}
+              />
               <span className="text-[#908fa0]">Session:</span>
               <span className="text-[#4cd7f6] font-semibold">{sessionId}</span>
             </div>
@@ -450,6 +595,17 @@ ${
             <span>Save to Suite</span>
           </button>
           <button
+            onClick={handleOptimize}
+            className="px-3.5 py-1.5 rounded-lg bg-[#262a33] hover:bg-[#31353e] border border-[#4cd7f6]/30 text-[#4cd7f6] text-xs font-semibold font-mono flex items-center gap-1.5 transition-all cursor-pointer shadow-sm"
+            title="Run the Optimizer Pipeline (merge typing, mask credentials, dedupe waits, flag brittle locators)"
+            id="optimizeBtn"
+          >
+            <span className="material-symbols-outlined text-[16px]">
+              tune
+            </span>
+            <span>Optimize</span>
+          </button>
+          <button
             onClick={handlePrepareForAI}
             className="px-3.5 py-1.5 rounded-lg bg-[#6750a4]/30 hover:bg-[#6750a4]/45 border border-[#c0c1ff]/30 text-[#dfe2ee] text-xs font-semibold font-mono flex items-center gap-1.5 transition-all cursor-pointer shadow-sm"
             title="Prepare captured events for AI Generation"
@@ -459,6 +615,33 @@ ${
             </span>
             <span>Prepare for AI</span>
           </button>
+          <button
+            onClick={handleExecuteClick}
+            className="px-3.5 py-1.5 rounded-lg bg-[#c0c1ff] hover:bg-[#a9aaff] text-[#1000a9] text-xs font-semibold font-mono flex items-center gap-1.5 transition-all cursor-pointer shadow-sm"
+            title="Open Credential Manager and execute the current Generated Playwright Spec"
+            id="executeBtn"
+          >
+            <span className="material-symbols-outlined text-[16px]">
+              play_circle
+            </span>
+            <span>Execute</span>
+          </button>
+          {executeStatus && (
+            <span
+              className={`px-2 py-1 rounded text-[10px] font-mono font-semibold uppercase flex items-center gap-1 ${
+                executeStatus === 'RUNNING'
+                  ? 'bg-amber-500/20 text-amber-300'
+                  : executeStatus === 'PASSED'
+                  ? 'bg-emerald-500/20 text-emerald-400'
+                  : 'bg-red-500/20 text-red-400'
+              }`}
+            >
+              {executeStatus === 'RUNNING' && (
+                <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
+              )}
+              {executeStatus}
+            </span>
+          )}
         </div>
       </div>
 
@@ -1209,8 +1392,15 @@ ${
               </span>
               GENERATED PLAYWRIGHT SPEC
             </span>
-            <span className="text-[#908fa0] text-[10px]">
-              {recordedActions.length} Actions
+            <span className="flex items-center gap-2">
+              {optimizedScript && (
+                <span className="px-2 py-0.5 rounded bg-[#4cd7f6]/15 text-[#4cd7f6] text-[10px] font-semibold">
+                  OPTIMIZED ({optimizedStepCount} steps)
+                </span>
+              )}
+              <span className="text-[#908fa0] text-[10px]">
+                {recordedActions.length} Actions
+              </span>
             </span>
           </div>
 
@@ -1240,7 +1430,9 @@ ${
             LIVE RECORDER TIMELINE
           </span>
           <span className="text-[#908fa0] text-[10px]">
-            {sessionLifecycleStatus === 'RUNNING'
+            {isStopping || sessionLifecycleStatus === 'STOPPING'
+              ? 'Stopping...'
+              : sessionLifecycleStatus === 'RUNNING'
               ? 'Streaming...'
               : sessionLifecycleStatus === 'FAILED'
               ? 'Session failed'
@@ -1290,6 +1482,14 @@ ${
           ))}
         </div>
       </div>
+
+      <CredentialManagerModal
+        isOpen={isCredentialModalOpen}
+        initialBaseUrl={targetUrl}
+        initialHeaded
+        onCancel={handleCredentialCancel}
+        onConfirm={handleCredentialConfirm}
+      />
     </div>
   );
 };

@@ -10,8 +10,12 @@ export const RUN_API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhos
  */
 export const runService = {
   /**
-   * Materializes the given spec (+ optional POM) on disk and starts a real
-   * Playwright test run.
+   * Starts a real Playwright test run. Two supported request shapes:
+   *  - Sprint 4 (Credential Manager): { spec, baseUrl, username, password,
+   *    browser, headed } — a single self-contained optimized spec, no POM.
+   *  - Legacy: { specName, specContent, pomName?, pomContent?, browser,
+   *    headless } — the Sandbox preset-demo flow.
+   * Either way, credentials never touch disk — see RunService#executeRun.
    * POST http://localhost:8099/api/run/execute
    */
   async startRun(request: RunExecuteRequest): Promise<RunExecuteResponse> {

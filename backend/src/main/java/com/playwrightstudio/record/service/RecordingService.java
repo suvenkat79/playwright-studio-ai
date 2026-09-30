@@ -199,7 +199,9 @@ public class RecordingService {
                     if (sessionOpt.isPresent()) {
                         RecordingSession sess = sessionOpt.get();
                         sess.setGeneratedTestScript(script);
-                        sess.setStatus(SessionStatus.STOPPED);
+                        if (sess.getStatus() != SessionStatus.FAILED) {
+                            sess.setStatus(SessionStatus.STOPPED);
+                        }
                     }
                     log.info("[RecordingService][{}] Browser session stopped gracefully. Script compiled ({} chars)", sessionId, script.length());
                     break;
@@ -233,6 +235,17 @@ public class RecordingService {
             RecordingSession session = sessionOpt.get();
             Process process = session.getProcess();
 
+            if (session.getStatus() == SessionStatus.FAILED) {
+                return new RecordStopResponse(
+                    "RECORDING_FAILED",
+                    sessionId,
+                    session.getEvents().size(),
+                    session.getGeneratedTestScript()
+                );
+            }
+
+            session.setStatus(SessionStatus.STOPPING);
+
             if (process != null && process.isAlive()) {
                 try {
                     // Send graceful STOP command to child process stdin
@@ -252,10 +265,12 @@ public class RecordingService {
                 }
             }
 
-            session.setStatus(SessionStatus.STOPPED);
+            if (session.getStatus() != SessionStatus.FAILED) {
+                session.setStatus(SessionStatus.STOPPED);
+            }
 
             return new RecordStopResponse(
-                "RECORDING_STOPPED",
+                session.getStatus() == SessionStatus.FAILED ? "RECORDING_FAILED" : "RECORDING_STOPPED",
                 sessionId,
                 session.getEvents().size(),
                 session.getGeneratedTestScript()

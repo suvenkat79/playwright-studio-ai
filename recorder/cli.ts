@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 import { recordingEngine } from './engine';
-import { RecordedBrowserEvent } from './types';
+import { ApplicationMetadata, RecordedBrowserEvent } from './types';
+import { PageMetadata } from './page-detector/types';
+import { FrameMetadata } from './frame-detector/types';
+import { IntentEntry, RecordedEvent } from './smart-recorder/types';
 import * as readline from 'readline';
 
 /**
@@ -9,9 +12,26 @@ import * as readline from 'readline';
  *
  * Protocol: Newline-Delimited JSON (NDJSON) via stdout:
  * - {"type":"SESSION_STARTED","sessionId":"...","url":"..."}
+ * - {"type":"APPLICATION_DETECTED","sessionId":"...","metadata":{...}}
+ * - {"type":"PAGE_DETECTED","sessionId":"...","metadata":{...}}
+ * - {"type":"FRAME_DETECTED","sessionId":"...","metadata":{...}}
  * - {"type":"EVENT","sessionId":"...","action":{...}}
+ * - {"type":"EVENT_RECORDED","sessionId":"...","event":{...}}
+ * - {"type":"NAVIGATION_RECORDED","sessionId":"...","event":{...}}
+ * - {"type":"INTENT_CLASSIFIED","sessionId":"...","eventId":"...","intent":{...}}
  * - {"type":"SESSION_STOPPED","sessionId":"...","actionCount":N,"testScript":"..."}
  * - {"type":"ERROR","sessionId":"...","message":"..."}
+ *
+ * APPLICATION_DETECTED (Sprint 5 Phase 1), PAGE_DETECTED (Sprint 5 Phase 2),
+ * FRAME_DETECTED (Sprint 5 Phase 3), and EVENT_RECORDED/NAVIGATION_RECORDED/
+ * INTENT_CLASSIFIED (Sprint 5.4 Smart Recorder) are purely additive — an
+ * unrecognized NDJSON `type` is already safely ignored by the backend's
+ * existing switch/default (RecordingService#handleProcessStdoutLine), so no
+ * backend change was needed for any of them to be backward compatible.
+ * EVENT (the pre-existing, Playwright-codeLine-carrying record) and
+ * EVENT_RECORDED (the new, framework-agnostic RecordedEvent) both fire for
+ * the same underlying interaction — separate, parallel streams, neither
+ * replacing the other.
  *
  * Input Commands (via stdin):
  * - STOP: Gracefully stops recording, compiles script, and exits
@@ -136,6 +156,35 @@ async function main() {
         // Chromium window closed by user
         console.error(`[Playwright CLI] Browser window closed by user.`);
         handleStop();
+      },
+      (metadata: ApplicationMetadata) => {
+        emitNDJSON('APPLICATION_DETECTED', {
+          sessionId: resolvedSessionId,
+          metadata
+        });
+      },
+      (metadata: PageMetadata) => {
+        emitNDJSON('PAGE_DETECTED', {
+          sessionId: resolvedSessionId,
+          metadata
+        });
+      },
+      (metadata: FrameMetadata) => {
+        emitNDJSON('FRAME_DETECTED', {
+          sessionId: resolvedSessionId,
+          metadata
+        });
+      },
+      (event: RecordedEvent, intent: IntentEntry) => {
+        emitNDJSON(event.type === 'navigation' ? 'NAVIGATION_RECORDED' : 'EVENT_RECORDED', {
+          sessionId: resolvedSessionId,
+          event
+        });
+        emitNDJSON('INTENT_CLASSIFIED', {
+          sessionId: resolvedSessionId,
+          eventId: event.id,
+          intent
+        });
       }
     );
 

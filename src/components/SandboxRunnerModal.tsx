@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { TestStep, SuiteFile, RunLifecycleStatus, RunReportPaths, RunStepDto } from '../types';
 import { runService, RUN_API_BASE_URL } from '../services/runService';
+import { CredentialManagerModal, CredentialManagerValues } from './CredentialManagerModal';
 
 interface SandboxRunnerModalProps {
   isOpen: boolean;
@@ -100,6 +101,7 @@ export const SandboxRunnerModal: React.FC<SandboxRunnerModalProps> = ({
   // (which the existing Steps/Visual tabs already render as-is).
   const [rawSteps, setRawSteps] = useState<RunStepDto[]>([]);
   const [logs, setLogs] = useState<string[]>([]);
+  const [isCredentialModalOpen, setIsCredentialModalOpen] = useState(false);
 
   // Reset live-run state when the target/browser/mode changes
   useEffect(() => {
@@ -165,7 +167,9 @@ export const SandboxRunnerModal: React.FC<SandboxRunnerModalProps> = ({
     }
   }, [runId, runStatus, reportPaths]);
 
-  const handleStartRun = async () => {
+  /** Actually launches the run, using whatever the Credential Manager
+   * modal was just confirmed with. */
+  const runWithCredentials = async (values: CredentialManagerValues) => {
     const spec = suiteFiles.find((f) => f.id === specId);
     const pom = suiteFiles.find((f) => f.id === pomId);
 
@@ -174,6 +178,9 @@ export const SandboxRunnerModal: React.FC<SandboxRunnerModalProps> = ({
       return;
     }
 
+    setSelectedBrowser(values.browser);
+    setHeadlessMode(!values.headed);
+
     setSteps([]);
     setRawSteps([]);
     setElapsedTimeMs(0);
@@ -181,9 +188,9 @@ export const SandboxRunnerModal: React.FC<SandboxRunnerModalProps> = ({
     setIsPaused(false);
     setRunStatus('RUNNING');
     setLogs([
-      `$ npx playwright test ${spec.name} --project=${selectedBrowser}${headlessMode ? '' : ' --headed'}`,
-      `[PLAYWRIGHT] Execution Mode: ${headlessMode ? 'HEADLESS (No window)' : 'HEADED (Visible Desktop Window)'}`,
-      `[RUNNER] Launching ${selectedBrowser} engine...`
+      `$ npx playwright test ${spec.name} --project=${values.browser}${values.headed ? ' --headed' : ''}`,
+      `[PLAYWRIGHT] Execution Mode: ${values.headed ? 'HEADED (Visible Desktop Window)' : 'HEADLESS (No window)'}`,
+      `[RUNNER] Launching ${values.browser} engine...`
     ]);
 
     try {
@@ -192,8 +199,17 @@ export const SandboxRunnerModal: React.FC<SandboxRunnerModalProps> = ({
         specContent: spec.content,
         pomName: pom?.name,
         pomContent: pom?.content,
-        browser: selectedBrowser,
-        headless: headlessMode
+        browser: values.browser,
+        headless: !values.headed,
+        headed: values.headed,
+        baseUrl: values.baseUrl,
+        username: values.username,
+        password: values.password,
+        credentials: {
+          BASE_URL: values.baseUrl,
+          APP_USERNAME: values.username,
+          APP_PASSWORD: values.password
+        }
       });
       setRunId(response.runId);
     } catch (err: unknown) {
@@ -201,6 +217,26 @@ export const SandboxRunnerModal: React.FC<SandboxRunnerModalProps> = ({
       setRunStatus('ERROR');
       setLogs((prev) => [...prev, `[ERROR] ${message}`]);
     }
+  };
+
+  /** Execute entry point: always confirms credentials/environment via the
+   * Credential Manager modal before launching a run. */
+  const handleStartRun = () => {
+    const spec = suiteFiles.find((f) => f.id === specId);
+    if (!spec) {
+      setLogs([`[ERROR] Could not find suite file "${specId}" to execute.`]);
+      return;
+    }
+    setIsCredentialModalOpen(true);
+  };
+
+  const handleCredentialConfirm = (values: CredentialManagerValues) => {
+    setIsCredentialModalOpen(false);
+    runWithCredentials(values);
+  };
+
+  const handleCredentialCancel = () => {
+    setIsCredentialModalOpen(false);
   };
 
   const handleReset = () => {
@@ -992,6 +1028,15 @@ export const SandboxRunnerModal: React.FC<SandboxRunnerModalProps> = ({
           </div>
         </div>
       </div>
+
+      <CredentialManagerModal
+        isOpen={isCredentialModalOpen}
+        initialBaseUrl={targetUrl}
+        initialBrowser={selectedBrowser}
+        initialHeaded={!headlessMode}
+        onCancel={handleCredentialCancel}
+        onConfirm={handleCredentialConfirm}
+      />
     </div>
   );
 };

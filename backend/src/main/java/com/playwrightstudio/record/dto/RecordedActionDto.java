@@ -11,6 +11,10 @@ public class RecordedActionDto {
     private String timestamp;
     private String codeLine;
     private String url;
+    private String frameSelector;
+    private Boolean isSensitive;
+    private String variableName;
+    private String identitySelector;
 
     public RecordedActionDto() {}
 
@@ -44,4 +48,16 @@ public class RecordedActionDto {
 
     public String getUrl() { return url; }
     public void setUrl(String url) { this.url = url; }
+
+    public String getFrameSelector() { return frameSelector; }
+    public void setFrameSelector(String frameSelector) { this.frameSelector = frameSelector; }
+
+    public Boolean getIsSensitive() { return isSensitive; }
+    public void setIsSensitive(Boolean isSensitive) { this.isSensitive = isSensitive; }
+
+    public String getVariableName() { return variableName; }
+    public void setVariableName(String variableName) { this.variableName = variableName; }
+
+    public String getIdentitySelector() { return identitySelector; }
+    public void setIdentitySelector(String identitySelector) { this.identitySelector = identitySelector; }
 }

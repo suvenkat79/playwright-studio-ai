@@ -54,6 +54,10 @@ All events and lifecycle notifications emitted to `stdout` are single-line JSON 
    ```json
    {"type":"EVENT","sessionId":"rec_123","action":{"id":"evt_1","type":"click","selector":"page.getByRole('button', { name: 'Submit' })","codeLine":"await page.getByRole('button', { name: 'Submit' }).click();","timestamp":"00:01.20"}}
    ```
+   Events captured inside an iframe also include its `frameSelector`; generated
+   locators are then scoped with `page.frameLocator(frameSelector)`.
+   Scrolls are coalesced while the page is moving and recorded as a final
+   scroll-position action for the page or the specific scrollable container.
 
 3. **Session Stopped**:
    ```json

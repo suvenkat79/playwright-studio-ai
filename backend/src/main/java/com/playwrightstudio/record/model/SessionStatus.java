@@ -5,6 +5,7 @@ package com.playwrightstudio.record.model;
  */
 public enum SessionStatus {
     RUNNING,
+    STOPPING,
     STOPPED,
     FAILED
 }

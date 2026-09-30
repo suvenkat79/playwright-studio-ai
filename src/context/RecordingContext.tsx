@@ -21,6 +21,7 @@ export interface RecordingContextType {
   // these independently in components):
   // IDLE (sessionId == null or STOPPED): canStart=true, canStop=false
   // RUNNING: canStart=false, canStop=true
+  // STOPPING: canStart=false, canStop=false
   // FAILED: canStart=true, canStop=false
   canStart: boolean;
   canStop: boolean;
@@ -32,9 +33,26 @@ export interface RecordingContextType {
 }
 
 const RecordingContext = createContext<RecordingContextType | undefined>(undefined);
+const SESSION_ID_STORAGE_KEY = 'playwright-studio-recording-session-id';
+
+async function waitForFinalSessionStatus(sessionId: string) {
+  const deadline = Date.now() + 30000;
+
+  while (Date.now() < deadline) {
+    const status = await recordService.getStatus(sessionId);
+    if (status.status === 'STOPPED' || status.status === 'FAILED' || status.failureReason) {
+      return status;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+
+  throw new Error('Timed out waiting for the backend to finish stopping the recording session.');
+}
 
 export const RecordingProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
-  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [sessionId, setSessionId] = useState<string | null>(
+    () => window.localStorage.getItem(SESSION_ID_STORAGE_KEY)
+  );
   const [status, setStatus] = useState<string | null>(null);
   const [sessionLifecycleStatus, setSessionLifecycleStatus] = useState<SessionLifecycleStatus | null>(null);
   const [recordedUrl, setRecordedUrl] = useState<string>('https://www.awwwards.com/websites/e-commerce/');
@@ -48,9 +66,52 @@ export const RecordingProvider: React.FC<{ children: ReactNode }> = ({ children 
   const [sessionStartedAt, setSessionStartedAt] = useState<number | null>(null);
   const [elapsedSeconds, setElapsedSeconds] = useState<number>(0);
 
+  useEffect(() => {
+    if (sessionId) {
+      window.localStorage.setItem(SESSION_ID_STORAGE_KEY, sessionId);
+    } else {
+      window.localStorage.removeItem(SESSION_ID_STORAGE_KEY);
+    }
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (!sessionId) return;
+
+    let cancelled = false;
+    recordService.getStatus(sessionId).then((statusData) => {
+      if (!cancelled) {
+        applyBackendStatus(statusData);
+      }
+    }).catch((statusErr: unknown) => {
+      if (!cancelled) {
+        console.warn('Unable to restore recording session status:', statusErr);
+        setSessionLifecycleStatus(null);
+        setIsLiveRecording(false);
+        setError(statusErr instanceof Error ? statusErr.message : 'Unable to restore recording session status');
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId]);
+
+  const applyBackendStatus = (statusData: Awaited<ReturnType<typeof recordService.getStatus>>) => {
+    const failed = statusData.status === 'FAILED' || Boolean(statusData.failureReason);
+    const nextStatus: SessionLifecycleStatus = failed ? 'FAILED' : statusData.status;
+    const isTerminal = nextStatus === 'STOPPED' || nextStatus === 'FAILED';
+
+    setSessionLifecycleStatus(nextStatus);
+    setError(failed ? statusData.failureReason || 'Recording session failed' : null);
+    setIsLiveRecording(!isTerminal);
+    if (isTerminal) {
+      setIsStopping(false);
+    }
+  };
+
   // Poll live events every 500ms while a real session is active.
-  // Stops automatically when the backend reports the session is no longer
-  // RUNNING (STOPPED/FAILED) or when this effect is torn down (unmount).
+  // Continues until the backend reports a terminal session status or this
+  // effect is torn down (unmount).
   useEffect(() => {
     if (!sessionId || !isLiveRecording) return;
 
@@ -65,22 +126,16 @@ export const RecordingProvider: React.FC<{ children: ReactNode }> = ({ children 
           setCapturedEvents(data.events);
         }
 
-        if (!data.isRecording) {
+        if (!data.isRecording && !isStopping) {
           // Confirm the exact lifecycle status (STOPPED vs FAILED) via the
           // dedicated status endpoint before halting the poll.
           try {
             const statusData = await recordService.getStatus(sessionId);
             if (!cancelled) {
-              setSessionLifecycleStatus(statusData.status);
-              if (statusData.status === 'FAILED') {
-                setError(statusData.failureReason || 'Recording session failed');
-              }
+              applyBackendStatus(statusData);
             }
           } catch (statusErr) {
             console.debug('[RecordingContext] Status check debug:', statusErr);
-          }
-          if (!cancelled) {
-            setIsLiveRecording(false);
           }
         }
       } catch (pollErr) {
@@ -95,7 +150,7 @@ export const RecordingProvider: React.FC<{ children: ReactNode }> = ({ children 
       cancelled = true;
       clearInterval(interval);
     };
-  }, [sessionId, isLiveRecording]);
+  }, [sessionId, isLiveRecording, isStopping]);
 
   // Tick session duration every second while a session is live
   useEffect(() => {
@@ -111,13 +166,13 @@ export const RecordingProvider: React.FC<{ children: ReactNode }> = ({ children 
   // Derived action-bar state, kept here so every button (across
   // ProjectHeader / StickyActionBar / LiveRecorderView) reads the exact same
   // computed value instead of re-deriving it from raw flags independently.
-  const canStart = !isStarting && !isLiveRecording;
-  const canStop = isLiveRecording && !isStopping;
+  const canStart = !isStarting && !isLiveRecording && !isStopping && sessionLifecycleStatus !== 'STOPPING';
+  const canStop = isLiveRecording && !isStopping && sessionLifecycleStatus !== 'STOPPING';
 
   const startRecording = async (targetUrl: string): Promise<StartRecordingResponse> => {
     // Guard against duplicate calls even if a caller bypasses the disabled
     // button state (e.g. a race between click and re-render).
-    if (isStarting || isLiveRecording) {
+    if (isStarting || isLiveRecording || isStopping) {
       throw new Error('A recording session is already starting or in progress.');
     }
 
@@ -125,6 +180,7 @@ export const RecordingProvider: React.FC<{ children: ReactNode }> = ({ children 
     setError(null);
     setCapturedEvents([]);
     setSessionLifecycleStatus(null);
+    setIsStopping(false);
     setElapsedSeconds(0);
 
     try {
@@ -149,21 +205,31 @@ export const RecordingProvider: React.FC<{ children: ReactNode }> = ({ children 
     if (!sessionId) return null;
 
     setIsStopping(true);
+    setSessionLifecycleStatus('STOPPING');
     try {
       const response = await recordService.stopRecording(sessionId);
-      setIsLiveRecording(false);
-      setSessionLifecycleStatus('STOPPED');
       if (response.testScript) {
         setLastGeneratedScript(response.testScript);
+      }
+
+      const finalStatus = await waitForFinalSessionStatus(sessionId);
+      applyBackendStatus(finalStatus);
+      setIsStopping(false);
+
+      if (finalStatus.status === 'FAILED' || finalStatus.failureReason) {
+        throw new Error(finalStatus.failureReason || 'Recording session failed');
       }
       return response;
     } catch (err: unknown) {
       console.warn('Failed to stop recording cleanly on backend:', err);
-      setIsLiveRecording(false);
-      setSessionLifecycleStatus('STOPPED');
-      return null;
-    } finally {
-      setIsStopping(false);
+      try {
+        const finalStatus = await recordService.getStatus(sessionId);
+        applyBackendStatus(finalStatus);
+        setIsStopping(false);
+      } catch (statusErr) {
+        console.warn('Unable to confirm recording session status after stop error:', statusErr);
+      }
+      throw err;
     }
   };
 
@@ -171,6 +237,7 @@ export const RecordingProvider: React.FC<{ children: ReactNode }> = ({ children 
     setSessionId(null);
     setStatus(null);
     setSessionLifecycleStatus(null);
+    setIsStopping(false);
     setIsLiveRecording(false);
     setError(null);
     setCapturedEvents([]);

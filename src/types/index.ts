@@ -45,12 +45,16 @@ export interface TestRun {
 
 export interface RecordedAction {
   id: string;
-  type: 'click' | 'fill' | 'select' | 'assert' | 'navigation' | 'press';
+  type: 'click' | 'fill' | 'select' | 'assert' | 'navigation' | 'press' | 'scroll';
   selector: string;
   value?: string;
   timestamp: string;
   codeLine: string;
   url?: string;
+  frameSelector?: string;
+  isSensitive?: boolean;
+  variableName?: string;
+  identitySelector?: string;
 }
 
 export interface DiagnosticsSummary {
@@ -89,7 +93,7 @@ export interface RecordingEventsResponse {
   totalEvents: number;
 }
 
-export type SessionLifecycleStatus = 'RUNNING' | 'STOPPED' | 'FAILED';
+export type SessionLifecycleStatus = 'RUNNING' | 'STOPPING' | 'STOPPED' | 'FAILED';
 
 export interface SessionStatusResponse {
   sessionId: string;
@@ -111,12 +115,28 @@ export interface ToastNotification {
 export type RunLifecycleStatus = 'RUNNING' | 'PASSED' | 'FAILED' | 'CANCELLED' | 'ERROR';
 
 export interface RunExecuteRequest {
-  specName: string;
-  specContent: string;
+  // Legacy shape (Sandbox preset-demo flow, still supported): a named spec
+  // file + optional POM, materialized to disk under run-workspace/.
+  specName?: string;
+  specContent?: string;
   pomName?: string;
   pomContent?: string;
-  browser: 'chromium' | 'firefox' | 'webkit';
   headless: boolean;
+
+  // Sprint 4 Credential Manager payload shape (primary path going forward):
+  // a single self-contained optimized spec string — no separate POM, since
+  // PlaywrightGenerator's output already inlines everything. When `spec` is
+  // present the backend prefers it over specContent.
+  spec?: string;
+  baseUrl?: string;
+  username?: string;
+  password?: string;
+  headed?: boolean;
+
+  browser: 'chromium' | 'firefox' | 'webkit';
+  // Execution-time only: variableName -> value (e.g. APP_USERNAME, APP_PASSWORD).
+  // Never persisted or logged — see RunService#executeRun on the backend.
+  credentials?: Record<string, string>;
 }
 
 export interface RunExecuteResponse {
@@ -171,4 +191,3 @@ export interface RunHistoryEntry {
   totalSteps: number;
   healedCount: number;
 }
-
