@@ -1,4 +1,5 @@
 import { OptimizedAction, OptimizerPlugin } from './types';
+import { NavigationOrderPlugin } from './NavigationOrderPlugin';
 import { TypingMergePlugin } from './TypingMergePlugin';
 import { CredentialPlugin } from './CredentialPlugin';
 import { SmartWaitPlugin } from './SmartWaitPlugin';
@@ -8,9 +9,9 @@ import { DynamicDataPlugin } from './DynamicDataPlugin';
 import { ActionAbstractionPlugin } from './ActionAbstractionPlugin';
 
 /**
- * Recorded Events -> TypingMergePlugin -> CredentialPlugin -> SmartWaitPlugin
- *                  -> NavigationParamPlugin -> LocatorPlugin -> DynamicDataPlugin
- *                  -> ActionAbstractionPlugin
+ * Recorded Events -> NavigationOrderPlugin -> TypingMergePlugin -> CredentialPlugin
+ *                  -> SmartWaitPlugin -> NavigationParamPlugin -> LocatorPlugin
+ *                  -> DynamicDataPlugin -> ActionAbstractionPlugin
  *                  -> PlaywrightGenerator (generateOptimizedSpec, in ../optimizerService.ts)
  *
  * DEFAULT_PLUGINS is the discoverable plugin set. Adding a future AI feature
@@ -25,6 +26,7 @@ import { ActionAbstractionPlugin } from './ActionAbstractionPlugin';
  * (40) — see DynamicDataPlugin's own doc comment for why that's fine.
  */
 const DEFAULT_PLUGINS: OptimizerPlugin[] = [
+  new NavigationOrderPlugin(),
   new TypingMergePlugin(),
   new CredentialPlugin(),
   new SmartWaitPlugin(),

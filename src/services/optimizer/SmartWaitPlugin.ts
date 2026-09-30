@@ -4,6 +4,28 @@ function isSameTarget(a: OptimizedAction, b: OptimizedAction): boolean {
   return a.selector === b.selector;
 }
 
+/** Parses the recorder's "MM:SS.ss" timestamp into total seconds, or null
+ * if it doesn't match that shape. */
+function parseTimestampSeconds(timestamp: string): number | null {
+  const match = /^(\d+):(\d+(?:\.\d+)?)$/.exec(timestamp);
+  if (!match) return null;
+  return Number(match[1]) * 60 + Number(match[2]);
+}
+
+/** Real UI double-click noise (an accidental double-tap) lands within a
+ * few hundred ms; a deliberate second click on a distinct element that
+ * happens to share the first one's locator string does not. 1s is well
+ * clear of genuine double-click timing while still well under any
+ * plausible "user paused, then retried" gap. */
+const DUPLICATE_CLICK_MAX_GAP_SECONDS = 1;
+
+function isLikelyAccidentalDuplicateClick(last: OptimizedAction, next: OptimizedAction): boolean {
+  const lastSeconds = parseTimestampSeconds(last.timestamp);
+  const nextSeconds = parseTimestampSeconds(next.timestamp);
+  if (lastSeconds === null || nextSeconds === null) return true; // unparseable — fall back to the old, safe-by-default behavior
+  return nextSeconds - lastSeconds <= DUPLICATE_CLICK_MAX_GAP_SECONDS;
+}
+
 /** Accessible name from any of the selector shapes the recorder/LocatorPlugin
  * produce — role, label, or plain text. Generic across strategies, not tied
  * to any one of them. */
@@ -44,7 +66,15 @@ function isPasswordVisibilityToggle(action: OptimizedAction): boolean {
  *     dropdown/combobox/date-picker's selectOption() is frequently the thing
  *     that actually opens the widget, so removing it can break the test —
  *     only FILL-follow-ups are treated as redundant.
- *  2. Duplicate consecutive CLICK events on the same target collapse to one.
+ *  2. Duplicate consecutive CLICK events on the same target collapse to
+ *     one, but only when they land within DUPLICATE_CLICK_MAX_GAP_SECONDS
+ *     of each other — genuine accidental double-click noise. Found live: a
+ *     real ServiceNow "Delete" click and the confirm button inside the
+ *     modal it opens are two different elements that happen to compute to
+ *     the identical locator (no ambiguous-name disambiguation existed for
+ *     plain buttons at the time), recorded ~2s apart — collapsing that
+ *     pair away entirely deleted the confirm click from the script, so
+ *     replay opened the modal and then never confirmed it.
  *  3. Consecutive NAVIGATE (waitForURL) events collapse to the final URL
  *     actually reached — only meaningful navigation waits survive.
  *  4. A keyboard PRESS('Enter') immediately followed by a CLICK is redundant
@@ -85,7 +115,10 @@ export class SmartWaitPlugin implements OptimizerPlugin {
     for (const next of redundantInteractionsDropped) {
       const last = output[output.length - 1];
 
-      if (last && next.type === 'click' && last.type === 'click' && isSameTarget(last, next)) {
+      if (
+        last && next.type === 'click' && last.type === 'click' && isSameTarget(last, next) &&
+        isLikelyAccidentalDuplicateClick(last, next)
+      ) {
         output[output.length - 1] = {
           ...last,
           timestamp: next.timestamp,

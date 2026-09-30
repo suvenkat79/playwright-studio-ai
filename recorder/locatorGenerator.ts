@@ -295,12 +295,40 @@ export const browserInjectionScript = `
     }
     const idNamePattern = /(^|_)(id|pk|uuid|guid)$/i;
     const idValuePattern = /^[0-9a-f]{16,}$|^\\d{4,}$|^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    // A case-SENSITIVE opaque-code shape: all-caps-or-digit, with at least
+    // one of each, no lowercase at all (e.g. Amazon's ASIN "B0HJB6KG27").
+    // Deliberately case sensitive, unlike idValuePattern above, so an
+    // ordinary lowercase URL slug/route segment is never mistaken for one
+    // regardless of length -- real route segments are conventionally
+    // lowercase-with-hyphens (e.g. "iPhone-18-Pro-Max-256", which fails
+    // this on both counts: mixed case and a hyphen).
+    const opaqueCodePattern = /^(?=.*[A-Z])(?=.*[0-9])[A-Z0-9]{6,14}$/;
+
     for (const [key, value] of destination.searchParams.entries()) {
       if (!value) continue;
       if (idNamePattern.test(key) || idValuePattern.test(value)) {
-        return { param: key, value: value };
+        return { matchText: key + '=' + value, fromPath: false };
       }
     }
+
+    // Many REST-ful / SEO-friendly URLs embed the real resource identifier
+    // directly in the path instead of a query param -- found live: a real
+    // Amazon product link is exactly this shape,
+    // /<product-title-slug>/dp/<ASIN>/ref=..., with the ASIN as the only
+    // genuinely stable part. Without this, only the query-param case above
+    // was ever checked, so a path-embedded identifier was silently missed
+    // entirely and the link fell back to the fully generic pattern, which
+    // breaks the moment Amazon's search ranking (the "ref=sr_1_1"-style
+    // position suffix also baked into the same URL) reshuffles between
+    // recording and replay -- an ever-present risk for organic search
+    // results, not a one-off.
+    const segments = destination.pathname.split('/').filter(Boolean);
+    for (const segment of segments) {
+      if (idValuePattern.test(segment) || opaqueCodePattern.test(segment)) {
+        return { matchText: segment, fromPath: true };
+      }
+    }
+
     return null;
   }
 
@@ -330,6 +358,22 @@ export const browserInjectionScript = `
     if (role) {
       const container = el.closest('[role="radiogroup"], [role="group"], [role="listbox"]') || el.parentElement;
       return container ? Array.from(container.querySelectorAll('[role="' + role + '"]')) : [el];
+    }
+    // No name/explicit-role attribute to group by -- true for a plain
+    // <button> or <a>, which get their interactive role implicitly from
+    // the tag itself, with nothing to scope sibling candidates to. Found
+    // live: a real ServiceNow "Delete" button and the confirm button
+    // inside the modal it opens are different elements, both named
+    // "Delete", with no shared name/role attribute connecting them --
+    // only a document-wide same-tag scan (the same permissive scope the
+    // name-attribute branch above already uses for radio/checkbox groups)
+    // can catch it. hasAmbiguousAccessibleName still only flags a real
+    // collision if another element computes to the exact same accessible
+    // name, so this doesn't affect the overwhelming majority of buttons/
+    // links whose names are already unique.
+    const tag = el.tagName.toLowerCase();
+    if (tag === 'button' || tag === 'a') {
+      return Array.from(document.querySelectorAll(tag));
     }
     return [el];
   }
@@ -430,6 +474,9 @@ export const browserInjectionScript = `
     }
 
     if (tag === 'button' || roleAttr === 'button') {
+      if (accName && hasAmbiguousAccessibleName(el, accName)) {
+        return buildDisambiguatedChoiceLocator(el);
+      }
       if (accName) {
         return {
           strategy: 'role',
@@ -472,15 +519,27 @@ export const browserInjectionScript = `
           JSON.stringify(hrefSelector) +
           "))";
 
+        // A query-param identity (e.g. ?sys_id=...) still gets AND'd with
+        // the stable pathname, since the endpoint name itself is genuinely
+        // stable and a meaningful extra scope. A path-embedded identity
+        // (e.g. Amazon's ASIN) must stand alone instead -- it was found
+        // *inside* the same path string hrefPatterns already represents in
+        // full, so combining the two would require the surrounding,
+        // frequently volatile part of that same path (a search-ranking
+        // suffix, a title slug that can be A/B tested) to ALSO still
+        // match, defeating the entire point of anchoring to the one part
+        // that's actually durable.
         const identity = extractLinkIdentity(el);
         const identitySelector = identity
-          ? hrefPatterns
-              .map((pattern) =>
-                'a[href*=' + JSON.stringify(pattern) +
-                (pattern.startsWith('%2F') || pattern.startsWith('%2f') ? ' i' : '') +
-                '][href*=' + JSON.stringify(identity.param + '=' + identity.value) + ']'
-              )
-              .join(', ')
+          ? identity.fromPath
+            ? 'a[href*=' + JSON.stringify(identity.matchText) + ']'
+            : hrefPatterns
+                .map((pattern) =>
+                  'a[href*=' + JSON.stringify(pattern) +
+                  (pattern.startsWith('%2F') || pattern.startsWith('%2f') ? ' i' : '') +
+                  '][href*=' + JSON.stringify(identity.matchText) + ']'
+                )
+                .join(', ')
           : undefined;
 
         return {

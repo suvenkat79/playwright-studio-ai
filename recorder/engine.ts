@@ -652,7 +652,16 @@ export class PlaywrightRecordingEngine {
       } else {
         console.log(`[Session ${sessionId}] Dialog: ${dialog.type()} — ${dialog.message()}`);
       }
-      await dialog.dismiss();
+      // Accept, not dismiss: found live — a real ServiceNow "Delete" click
+      // opens a native confirm() dialog, and dismissing it silently
+      // cancels the very action the user just took, with no visible sign
+      // anything went wrong. The user re-clicked "Delete" a second time,
+      // 2 seconds later, on the exact same button — a real recording of
+      // someone retrying because nothing appeared to happen. Accepting
+      // matches the overwhelmingly common real intent for a
+      // confirm-before-destructive-action dialog: the user already chose
+      // to proceed by triggering it in the first place.
+      await dialog.accept();
     });
 
     page.on('download', (download) => {
