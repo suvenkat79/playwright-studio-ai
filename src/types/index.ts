@@ -55,6 +55,7 @@ export interface RecordedAction {
   isSensitive?: boolean;
   variableName?: string;
   identitySelector?: string;
+  tabIndex?: number;
 }
 
 export interface DiagnosticsSummary {

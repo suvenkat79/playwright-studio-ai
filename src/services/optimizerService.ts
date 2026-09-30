@@ -44,6 +44,7 @@ function toOptimized(action: RecordedAction): OptimizedAction {
     isSensitive: action.isSensitive,
     variableName: action.variableName,
     identitySelector: action.identitySelector,
+    tabIndex: action.tabIndex ?? 0,
     // Computed here (not deferred to LocatorPlugin) because TypingMergePlugin
     // needs quality ranking *during* merge to keep the better of two
     // representations of the same field. LocatorPlugin still owns the final
@@ -151,18 +152,30 @@ function isRedundantClickBeforeFrameNavigation(
     action.frameSelector === nextAction.frameSelector;
 }
 
+/**
+ * `pagePrefix` (default 'page') lets a locator captured on a secondary
+ * browser tab (see the multi-tab notes on generateOptimizedSpec below) be
+ * aliased to that tab's own page variable (e.g. 'page1') instead of the
+ * literal 'page' every recorded selector starts with. Only applied when
+ * frameSelector is unset — an iframe on a secondary tab is a real
+ * combination this doesn't yet handle; frame-aliasing (the far more common
+ * case) takes priority and is unchanged from before.
+ */
 function toFrameAliasedLocator(
   selector: string,
   frameSelector: string | undefined,
-  frameAliases: Map<string, string>
+  frameAliases: Map<string, string>,
+  pagePrefix: string = 'page'
 ): string {
-  if (!frameSelector) return selector;
-  const alias = frameAliases.get(frameSelector);
-  if (!alias) return selector;
-  const frameLocator = `page.frameLocator(${JSON.stringify(frameSelector)})`;
-  return selector.startsWith(`${frameLocator}.`)
-    ? selector.replace(`${frameLocator}.`, `${alias}.`)
-    : selector.replace(/^page\./, `${alias}.`);
+  if (frameSelector) {
+    const alias = frameAliases.get(frameSelector);
+    if (!alias) return selector;
+    const frameLocator = `page.frameLocator(${JSON.stringify(frameSelector)})`;
+    return selector.startsWith(`${frameLocator}.`)
+      ? selector.replace(`${frameLocator}.`, `${alias}.`)
+      : selector.replace(/^page\./, `${alias}.`);
+  }
+  return pagePrefix !== 'page' ? selector.replace(/^page\./, `${pagePrefix}.`) : selector;
 }
 
 /**
@@ -194,7 +207,8 @@ function toFrameAliasedLocator(
 function buildOpenerResilienceSnippet(
   actions: OptimizedAction[],
   index: number,
-  frameAliases: Map<string, string>
+  frameAliases: Map<string, string>,
+  pagePrefix: string = 'page'
 ): string {
   const action = actions[index];
   const prior = actions[index - 1];
@@ -203,9 +217,10 @@ function buildOpenerResilienceSnippet(
   if (!targetIsInteraction || !prior || prior.type !== 'click') return '';
   if (prior.selector === action.selector) return '';
   if (prior.frameSelector !== action.frameSelector) return '';
+  if (prior.tabIndex !== action.tabIndex) return '';
 
-  const openerLocator = toFrameAliasedLocator(prior.selector, prior.frameSelector, frameAliases);
-  const targetLocator = toFrameAliasedLocator(action.selector, action.frameSelector, frameAliases);
+  const openerLocator = toFrameAliasedLocator(prior.selector, prior.frameSelector, frameAliases, pagePrefix);
+  const targetLocator = toFrameAliasedLocator(action.selector, action.frameSelector, frameAliases, pagePrefix);
 
   return (
     `  await ${targetLocator}.waitFor({ state: 'visible', timeout: 5000 }).catch(async () => {\n` +
@@ -230,18 +245,20 @@ function buildOpenerResilienceSnippet(
  */
 function buildIdentityAnchoredSnippet(
   action: OptimizedAction,
-  frameAliases: Map<string, string>
+  frameAliases: Map<string, string>,
+  pagePrefix: string = 'page'
 ): string | null {
   if (action.type !== 'click' || !action.identitySelector) return null;
 
   const identityLocator = toFrameAliasedLocator(
     `page.locator(${JSON.stringify(action.identitySelector)})`,
     action.frameSelector,
-    frameAliases
+    frameAliases,
+    pagePrefix
   );
   const fallbackLocator = visibleFirstLocator(
     action,
-    toFrameAliasedLocator(action.selector, action.frameSelector, frameAliases)
+    toFrameAliasedLocator(action.selector, action.frameSelector, frameAliases, pagePrefix)
   );
   const varName = `identityTarget_${action.id.replace(/[^a-zA-Z0-9_]/g, '_')}`;
 
@@ -370,9 +387,62 @@ export function generateOptimizedSpec(actions: OptimizedAction[], targetUrl: str
     })
     .join('\n');
 
+  // Multi-tab support: a click that opens a new browser tab (a
+  // target="_blank" link, window.open()) needs the script to capture that
+  // new Playwright Page object and switch every subsequent same-tab action
+  // to it — otherwise replay keeps acting on the original tab, where the
+  // corresponding element never existed. Found live: an Amazon
+  // sponsored-product link opens its target in a new tab, and every
+  // interaction after that click (color/variant selection, Add to Cart)
+  // had nothing to act on, because nothing was switching pages at all.
+  // pageAliases mirrors frameAliases's shape/naming for the same reason —
+  // one small, consistent convention for "this locator lives somewhere
+  // other than the default `page`." Known limitation: an iframe inside a
+  // secondary tab isn't handled (frameSelector aliasing always wins over
+  // page aliasing below) — no evidence of that combination yet to justify
+  // the added complexity.
+  const tabIndices = [...new Set(actions.map((a) => a.tabIndex).filter((t) => t > 0))].sort((a, b) => a - b);
+  const pageAliases = new Map(tabIndices.map((t) => [t, `page${t}`]));
+  const pagePrefixFor = (tabIndex: number): string => pageAliases.get(tabIndex) ?? 'page';
+  // action index -> the new tabIndex the click at that index opens (the
+  // very next action's tabIndex is higher than this one's own).
+  const tabOpenerNewIndex = new Map<number, number>();
+  actions.forEach((action, i) => {
+    const next = actions[i + 1];
+    if (next && next.tabIndex > action.tabIndex) {
+      tabOpenerNewIndex.set(i, next.tabIndex);
+    }
+  });
+
   const actionsCode = actions.map((action, index) => {
     if (isRedundantClickBeforeFrameNavigation(actions, index)) {
       return '';
+    }
+
+    const opensNewTabIndex = tabOpenerNewIndex.get(index);
+    if (opensNewTabIndex !== undefined && action.type === 'click') {
+      const pageVar = pageAliases.get(opensNewTabIndex)!;
+      const clickLocator = visibleFirstLocator(
+        action,
+        toFrameAliasedLocator(action.selector, action.frameSelector, frameAliases, pagePrefixFor(action.tabIndex))
+      );
+      const openerResilience = buildOpenerResilienceSnippet(actions, index, frameAliases, pagePrefixFor(action.tabIndex));
+      return (
+        `${openerResilience}  const [${pageVar}] = await Promise.all([\n` +
+        `    context.waitForEvent('page'),\n` +
+        `    ${clickLocator}.click()\n` +
+        `  ]);`
+      );
+    }
+
+    if (action.type === 'navigation' && action.tabIndex > 0) {
+      const previousActionAny = actions[index - 1];
+      const isFirstOnThisTab = !previousActionAny || previousActionAny.tabIndex !== action.tabIndex;
+      if (isFirstOnThisTab && action.codeLine) {
+        const pageVar = pagePrefixFor(action.tabIndex);
+        const aliasedCodeLine = action.codeLine.replace(/^await page\./, `await ${pageVar}.`);
+        return `  ${aliasedCodeLine}`;
+      }
     }
 
     if (action.type === 'navigation') {
@@ -509,9 +579,11 @@ export function generateOptimizedSpec(actions: OptimizedAction[], targetUrl: str
       }
     }
 
-    const identitySnippet = buildIdentityAnchoredSnippet(action, frameAliases);
+    const pagePrefix = pagePrefixFor(action.tabIndex);
+
+    const identitySnippet = buildIdentityAnchoredSnippet(action, frameAliases, pagePrefix);
     if (identitySnippet) {
-      const openerResilience = buildOpenerResilienceSnippet(actions, index, frameAliases);
+      const openerResilience = buildOpenerResilienceSnippet(actions, index, frameAliases, pagePrefix);
       return `${openerResilience}${identitySnippet}`;
     }
 
@@ -526,19 +598,21 @@ export function generateOptimizedSpec(actions: OptimizedAction[], targetUrl: str
       if (action.type === 'click' && /name:\s*\//.test(codeLine)) {
         codeLine = codeLine.replace(/\.click\(\);?$/, '.first().click();');
       }
+    } else if (pagePrefix !== 'page') {
+      codeLine = codeLine.replace(/^(\s*await )page\./, (_match, prefix: string) => `${prefix}${pagePrefix}.`);
     }
     if (isSubmitButton(action)) {
       codeLine = codeLine.replace(/\.click\(\);?$/, '.first().click();');
     }
     codeLine = visibleFirstAction(action, codeLine);
-    const openerResilience = buildOpenerResilienceSnippet(actions, index, frameAliases);
+    const openerResilience = buildOpenerResilienceSnippet(actions, index, frameAliases, pagePrefix);
     return `${openerResilience}  ${codeLine}`;
   }).join('\n');
 
   return `import { test, expect } from '@playwright/test';
 
 test.describe('Optimized User Journey: ${targetUrl}', () => {
-  test('Execute optimized actions', async ({ page }) => {
+  test('Execute optimized actions', async ({ page${tabIndices.length > 0 ? ', context' : ''} }) => {
     // Generated by the Optimizer Pipeline: TypingMerge -> Credential -> SmartWait -> Locator -> PlaywrightGenerator.
     // Derived from the recorded session — the original recorded events are never modified.
 

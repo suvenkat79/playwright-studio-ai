@@ -58,7 +58,11 @@ export const CredentialManagerModal: React.FC<CredentialManagerModalProps> = ({
 
   const handleConfirm = (e: React.FormEvent) => {
     e.preventDefault();
-    onConfirm({ baseUrl: baseUrl.trim(), username, password, browser, headed });
+    // Strip any trailing slash(es)/backslash(es) so the generated
+    // page.goto(`${BASE_URL}/path`) never doubles up the separator
+    // regardless of whether the user typed a trailing one here.
+    const normalizedBaseUrl = baseUrl.trim().replace(/[\\/]+$/, '');
+    onConfirm({ baseUrl: normalizedBaseUrl, username, password, browser, headed });
   };
 
   return (

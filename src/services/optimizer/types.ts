@@ -40,6 +40,13 @@ export interface OptimizedAction {
    * PlaywrightGenerator prefers re-targeting this exact record on replay,
    * falling back to `selector` if it's no longer there. */
   identitySelector?: string;
+  /** 0 for the original recording tab, 1/2/... for each subsequent tab or
+   * popup the browser context opened (see recorder/types.ts's
+   * RecordedBrowserEvent.tabIndex) — PlaywrightGenerator uses this to
+   * detect a tab switch and generate a context.waitForEvent('page') plus a
+   * page-aliased locator, the same way frameSelector drives frameLocator
+   * aliasing for iframes. */
+  tabIndex: number;
   locatorQuality: LocatorQuality;
   /** Set by LocatorPlugin — the scored assessment of this action's selector. */
   locatorCandidate?: LocatorCandidate;

@@ -157,6 +157,13 @@ export interface RecordedBrowserEvent {
    * the generic pattern first," while still degrading to the generic
    * selector if that specific record is gone by replay time. */
   identitySelector?: string;
+  /** 0 for the original recording tab, 1/2/... for each subsequent tab or
+   * popup the browser context opens (a target="_blank" link, window.open())
+   * — assigned in open order. Lets replay know it needs to switch to a
+   * different Playwright Page object for this and later same-tabIndex
+   * events, rather than continuing to act on the original tab where the
+   * corresponding element no longer exists. */
+  tabIndex: number;
 }
 
 export interface RecordingSession {

@@ -15,6 +15,7 @@ public class RecordedActionDto {
     private Boolean isSensitive;
     private String variableName;
     private String identitySelector;
+    private int tabIndex;
 
     public RecordedActionDto() {}
 
@@ -60,4 +61,7 @@ public class RecordedActionDto {
 
     public String getIdentitySelector() { return identitySelector; }
     public void setIdentitySelector(String identitySelector) { this.identitySelector = identitySelector; }
+
+    public int getTabIndex() { return tabIndex; }
+    public void setTabIndex(int tabIndex) { this.tabIndex = tabIndex; }
 }

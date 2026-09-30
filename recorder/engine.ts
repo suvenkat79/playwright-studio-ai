@@ -165,6 +165,12 @@ export class PlaywrightRecordingEngine {
 
     const page: Page = await context.newPage();
 
+    // Assigns each Page object in this context a stable, open-order index
+    // (0 = the original tab) so every emitted event can be stamped with
+    // which tab it actually happened in — see RecordedBrowserEvent.tabIndex.
+    const pageIndices = new Map<Page, number>();
+    pageIndices.set(page, 0);
+
     const session: RecordingSession = {
       id: sessionId,
       targetUrl: formattedUrl,
@@ -191,15 +197,23 @@ export class PlaywrightRecordingEngine {
       selector: 'page',
       url: formattedUrl,
       timestamp: '00:00.00',
-      codeLine: `await page.goto('${formattedUrl}');`
+      codeLine: `await page.goto('${formattedUrl}');`,
+      tabIndex: 0
     };
     session.events.push(initNavEvent);
     if (onEvent) {
       onEvent(initNavEvent);
     }
 
-    // Expose binding to receive live DOM events from browser
-    await page.exposeBinding('__playwrightStudioEmitEvent', async ({ frame }, rawEvent: {
+    // Expose binding to receive live DOM events from browser. Registered on
+    // the *context*, not the page: Playwright applies a context-level
+    // exposeBinding to every page in the context, including ones opened
+    // later (a target="_blank" link, window.open()) — a page-level one
+    // only ever covered the single page it was called on. Found live: a
+    // real Amazon sponsored-product link opens its target page in a brand
+    // new tab, and every interaction after that click was silently
+    // uncaptured, because nothing was listening on that tab at all.
+    await context.exposeBinding('__playwrightStudioEmitEvent', async ({ frame }, rawEvent: {
       type: 'click' | 'fill' | 'select' | 'assert' | 'press' | 'check' | 'upload' | 'scroll';
       selector: string;
       value?: string;
@@ -220,7 +234,7 @@ export class PlaywrightRecordingEngine {
       identitySelector?: string;
     }) => {
       let frameSelector = rawEvent.frameSelector;
-      if (!frameSelector && frame !== page.mainFrame()) {
+      if (!frameSelector && frame !== frame.page().mainFrame()) {
         frameSelector = await getFrameSelector(frame);
       }
 
@@ -240,7 +254,8 @@ export class PlaywrightRecordingEngine {
         frameSelector,
         isSensitive: rawEvent.isSensitive,
         variableName: rawEvent.variableName,
-        identitySelector: rawEvent.identitySelector
+        identitySelector: rawEvent.identitySelector,
+        tabIndex: pageIndices.get(frame.page()) ?? 0
       };
 
       session.events.push(event);
@@ -286,114 +301,22 @@ export class PlaywrightRecordingEngine {
       }
     });
 
-    // Inject locator generator & event interceptors on every navigation
-    await page.addInitScript(browserInjectionScript);
+    // Inject locator generator & event interceptors on every navigation, in
+    // every page the context ever opens (see exposeBinding note above for
+    // why context-level, not page-level).
+    await context.addInitScript(browserInjectionScript);
 
-    // Listen for subsequent page navigations
-    let lastKnownUrl = formattedUrl; // Sprint 5.4: fromUrl for Smart Recorder navigation tracking
-    page.on('framenavigated', (frame) => {
-      if (frame === page.mainFrame() && frame.url() !== formattedUrl && !frame.url().startsWith('about:')) {
-        const elapsedSeconds = ((Date.now() - session.startTime) / 1000).toFixed(2);
-        const minutes = Math.floor(Number(elapsedSeconds) / 60);
-        const seconds = (Number(elapsedSeconds) % 60).toFixed(2);
-        const timestamp = `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(5, '0')}`;
-
-        const navEvent: RecordedBrowserEvent = {
-          id: `evt_nav_${Date.now()}`,
-          type: 'navigation',
-          selector: 'page',
-          url: frame.url(),
-          timestamp,
-          codeLine: navigationWaitCode(frame.url())
-        };
-
-        session.events.push(navEvent);
-        if (onEvent) {
-          onEvent(navEvent);
-        }
-        console.log(`[Session ${sessionId}] Navigated to: ${frame.url()}`);
-
-        // Smart Recorder (Sprint 5.4) — captured at the moment the
-        // navigation is observed, per "do not infer later". Uses the
-        // Context Engine metadata as it stood just before this navigation
-        // (the re-detection triggered by this same 'framenavigated' event,
-        // below, hasn't run yet at this point in the listener order).
-        const context = this.getDetectionContext(session);
-        if (context) {
-          const { event: navigationEvent, intent } = session.smartRecorder.recordNavigation(lastKnownUrl, frame.url(), context);
-          session.recordedEvents.push(navigationEvent);
-          session.intentTimeline.push(intent);
-          console.log(`[Session ${sessionId}] Event recorded: ${describeRecordedEvent(navigationEvent, intent)}`);
-          if (onEventRecorded) {
-            onEventRecorded(navigationEvent, intent);
-          }
-        }
-        lastKnownUrl = frame.url();
-      }
-    });
-
-    // Page/Frame re-detection lifecycle (Sprint 5 Phase 3 lifecycle patch).
-    // Separate listeners from the event-capture one above — deliberately
-    // not merged into it, so the existing recording/codegen path is
-    // untouched. ApplicationDetector never re-runs (ApplicationMetadata is
-    // captured once, below, and reused as-is here). PageDetector re-runs on
-    // every successful main-frame navigation (URL change, frame
-    // navigation, or document load — 'framenavigated' and 'load' together
-    // cover all three; re-detection is idempotent since it only emits/
-    // records on an actual change, so both listeners firing for the same
-    // navigation is harmless). FrameDetector re-runs whenever PageDetector
-    // runs, or on its own when a non-main frame navigates.
-    page.on('framenavigated', (frame) => {
-      if (frame.url().startsWith('about:')) return;
-      void this.handleFrameNavigated(session, sessionId, page, frame, onPageDetected, onFrameDetected);
-    });
-    page.on('load', () => {
-      void this.handleFrameNavigated(session, sessionId, page, page.mainFrame(), onPageDetected, onFrameDetected);
-    });
-
-    // Dialog / Download capture (Sprint 5.4). Playwright auto-dismisses
-    // dialogs when no listener is registered — attaching one makes this
-    // code responsible for that same dismissal (otherwise the dialog would
-    // block the page indefinitely), so dialog.dismiss() below preserves
-    // the pre-existing no-hang behavior while adding capture on top of it.
-    page.on('dialog', async (dialog) => {
-      const context = this.getDetectionContext(session);
-      if (context) {
-        const { event, intent } = session.smartRecorder.recordDialog(dialog.type(), dialog.message(), context);
-        session.recordedEvents.push(event);
-        session.intentTimeline.push(intent);
-        console.log(`[Session ${sessionId}] Event recorded: ${describeRecordedEvent(event, intent)}`);
-        if (onEventRecorded) {
-          onEventRecorded(event, intent);
-        }
-      } else {
-        console.log(`[Session ${sessionId}] Dialog: ${dialog.type()} — ${dialog.message()}`);
-      }
-      await dialog.dismiss();
-    });
-
-    page.on('download', (download) => {
-      const context = this.getDetectionContext(session);
-      if (context) {
-        const { event, intent } = session.smartRecorder.recordDownload(download.suggestedFilename(), context);
-        session.recordedEvents.push(event);
-        session.intentTimeline.push(intent);
-        console.log(`[Session ${sessionId}] Event recorded: ${describeRecordedEvent(event, intent)}`);
-        if (onEventRecorded) {
-          onEventRecorded(event, intent);
-        }
-      } else {
-        console.log(`[Session ${sessionId}] Download: ${download.suggestedFilename()}`);
-      }
-    });
-
-    // Handle browser closure
-    page.on('close', () => {
-      console.log(`[Session ${sessionId}] Browser page closed by user`);
-      session.isActive = false;
-      if (onClose) {
-        onClose();
-      }
+    // Every tab/popup the context opens — the original page and any later
+    // one from a target="_blank" link or window.open() — gets the same
+    // navigation/dialog/download/close capture wired up via this one
+    // shared setup, so a flow that continues in a new tab is no longer
+    // silently invisible to the recorder.
+    this.attachPageListeners(session, sessionId, page, formattedUrl, 0, onEvent, onClose, onPageDetected, onFrameDetected, onEventRecorded);
+    context.on('page', (newPage) => {
+      const tabIndex = pageIndices.size;
+      pageIndices.set(newPage, tabIndex);
+      console.log(`[Session ${sessionId}] New tab/popup opened (tabIndex ${tabIndex}): ${newPage.url()}`);
+      this.attachPageListeners(session, sessionId, newPage, newPage.url(), tabIndex, onEvent, onClose, onPageDetected, onFrameDetected, onEventRecorded);
     });
 
     // Navigate to initial target URL
@@ -622,6 +545,146 @@ export class PlaywrightRecordingEngine {
         onFrameDetected(frameMetadata);
       }
     }
+  }
+
+  /**
+   * Wires up navigation-tracking, Context Engine re-detection, dialog,
+   * download, and close capture for one page — the original tab, or any
+   * later tab/popup the browser context opens. Extracted from what used to
+   * be inline-only logic for the single original page, so every page gets
+   * identical treatment: a flow that continues in a new tab (a
+   * target="_blank" link, window.open()) is captured exactly as
+   * completely as one that stays in the original tab. `lastKnownUrl` is
+   * scoped to this one page's own closure, not shared across pages, so
+   * each tab's Smart Recorder navigation history (fromUrl/toUrl) reflects
+   * only its own navigations.
+   */
+  private attachPageListeners(
+    session: RecordingSession,
+    sessionId: string,
+    page: Page,
+    initialUrl: string,
+    tabIndex: number,
+    onEvent?: (event: RecordedBrowserEvent) => void,
+    onClose?: () => void,
+    onPageDetected?: (metadata: PageMetadata) => void,
+    onFrameDetected?: (metadata: FrameMetadata) => void,
+    onEventRecorded?: (event: RecordedEvent, intent: IntentEntry) => void
+  ): void {
+    let lastKnownUrl = initialUrl; // Sprint 5.4: fromUrl for Smart Recorder navigation tracking
+
+    page.on('framenavigated', (frame) => {
+      if (frame === page.mainFrame() && frame.url() !== initialUrl && !frame.url().startsWith('about:')) {
+        const elapsedSeconds = ((Date.now() - session.startTime) / 1000).toFixed(2);
+        const minutes = Math.floor(Number(elapsedSeconds) / 60);
+        const seconds = (Number(elapsedSeconds) % 60).toFixed(2);
+        const timestamp = `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(5, '0')}`;
+
+        const navEvent: RecordedBrowserEvent = {
+          id: `evt_nav_${Date.now()}`,
+          type: 'navigation',
+          selector: 'page',
+          url: frame.url(),
+          timestamp,
+          codeLine: navigationWaitCode(frame.url()),
+          tabIndex
+        };
+
+        session.events.push(navEvent);
+        if (onEvent) {
+          onEvent(navEvent);
+        }
+        console.log(`[Session ${sessionId}] Navigated to: ${frame.url()}`);
+
+        // Smart Recorder (Sprint 5.4) — captured at the moment the
+        // navigation is observed, per "do not infer later". Uses the
+        // Context Engine metadata as it stood just before this navigation
+        // (the re-detection triggered by this same 'framenavigated' event,
+        // below, hasn't run yet at this point in the listener order).
+        const context = this.getDetectionContext(session);
+        if (context) {
+          const { event: navigationEvent, intent } = session.smartRecorder.recordNavigation(lastKnownUrl, frame.url(), context);
+          session.recordedEvents.push(navigationEvent);
+          session.intentTimeline.push(intent);
+          console.log(`[Session ${sessionId}] Event recorded: ${describeRecordedEvent(navigationEvent, intent)}`);
+          if (onEventRecorded) {
+            onEventRecorded(navigationEvent, intent);
+          }
+        }
+        lastKnownUrl = frame.url();
+      }
+    });
+
+    // Page/Frame re-detection lifecycle (Sprint 5 Phase 3 lifecycle patch).
+    // Separate listeners from the event-capture one above — deliberately
+    // not merged into it, so the existing recording/codegen path is
+    // untouched. ApplicationDetector never re-runs (ApplicationMetadata is
+    // captured once, in startSession, and reused as-is here). PageDetector
+    // re-runs on every successful main-frame navigation (URL change, frame
+    // navigation, or document load — 'framenavigated' and 'load' together
+    // cover all three; re-detection is idempotent since it only emits/
+    // records on an actual change, so both listeners firing for the same
+    // navigation is harmless). FrameDetector re-runs whenever PageDetector
+    // runs, or on its own when a non-main frame navigates.
+    page.on('framenavigated', (frame) => {
+      if (frame.url().startsWith('about:')) return;
+      void this.handleFrameNavigated(session, sessionId, page, frame, onPageDetected, onFrameDetected);
+    });
+    page.on('load', () => {
+      void this.handleFrameNavigated(session, sessionId, page, page.mainFrame(), onPageDetected, onFrameDetected);
+    });
+
+    // Dialog / Download capture (Sprint 5.4). Playwright auto-dismisses
+    // dialogs when no listener is registered — attaching one makes this
+    // code responsible for that same dismissal (otherwise the dialog would
+    // block the page indefinitely), so dialog.dismiss() below preserves
+    // the pre-existing no-hang behavior while adding capture on top of it.
+    page.on('dialog', async (dialog) => {
+      const context = this.getDetectionContext(session);
+      if (context) {
+        const { event, intent } = session.smartRecorder.recordDialog(dialog.type(), dialog.message(), context);
+        session.recordedEvents.push(event);
+        session.intentTimeline.push(intent);
+        console.log(`[Session ${sessionId}] Event recorded: ${describeRecordedEvent(event, intent)}`);
+        if (onEventRecorded) {
+          onEventRecorded(event, intent);
+        }
+      } else {
+        console.log(`[Session ${sessionId}] Dialog: ${dialog.type()} — ${dialog.message()}`);
+      }
+      await dialog.dismiss();
+    });
+
+    page.on('download', (download) => {
+      const context = this.getDetectionContext(session);
+      if (context) {
+        const { event, intent } = session.smartRecorder.recordDownload(download.suggestedFilename(), context);
+        session.recordedEvents.push(event);
+        session.intentTimeline.push(intent);
+        console.log(`[Session ${sessionId}] Event recorded: ${describeRecordedEvent(event, intent)}`);
+        if (onEventRecorded) {
+          onEventRecorded(event, intent);
+        }
+      } else {
+        console.log(`[Session ${sessionId}] Download: ${download.suggestedFilename()}`);
+      }
+    });
+
+    // Handle this page/tab closing. Only the original page closing ends
+    // the whole recording session (onClose) — closing a secondary tab the
+    // flow opened along the way (e.g. closing a popup after using it) is
+    // normal mid-session behavior, not the user ending the recording.
+    page.on('close', () => {
+      if (page === session.page) {
+        console.log(`[Session ${sessionId}] Browser page closed by user`);
+        session.isActive = false;
+        if (onClose) {
+          onClose();
+        }
+      } else {
+        console.log(`[Session ${sessionId}] Secondary tab closed: ${page.url()}`);
+      }
+    });
   }
 
   /**
