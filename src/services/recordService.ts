@@ -5,7 +5,12 @@ import {
   StopRecordingRequest,
   StopRecordingResponse,
   RecordingEventsResponse,
-  SessionStatusResponse
+  SessionStatusResponse,
+  ResolveIntentRequest,
+  ResolveIntentResponse,
+  StartResolutionSessionRequest,
+  StartResolutionSessionResponse,
+  CloseResolutionSessionRequest
 } from '../types';
 
 export const RECORD_API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8099';
@@ -70,6 +75,52 @@ export const recordService = {
       `${RECORD_API_BASE_URL}/api/record/status?sessionId=${encodeURIComponent(sessionId)}`,
       {
         method: 'GET'
+      }
+    );
+  },
+
+  async startResolutionSession(
+    targetUrl: string,
+    sourceSessionId?: string
+  ): Promise<StartResolutionSessionResponse> {
+    const payload: StartResolutionSessionRequest = { url: targetUrl, sourceSessionId };
+    return await apiClient<StartResolutionSessionResponse>(
+      `${RECORD_API_BASE_URL}/api/record/resolution/start`,
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+        timeoutMs: 45000
+      }
+    );
+  },
+
+  async closeResolutionSession(sessionId: string): Promise<void> {
+    const payload: CloseResolutionSessionRequest = { sessionId };
+    await apiClient<void>(
+      `${RECORD_API_BASE_URL}/api/record/resolution/stop`,
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+        timeoutMs: 10000
+      }
+    );
+  },
+
+  /**
+   * AI Gen: resolves one natural-language instruction against the live
+   * page of an active recording session. Rejects with an ApiError (status
+   * 409) when there is no active session to resolve against — callers
+   * should treat that as "start a live session first," not retry.
+   * POST http://localhost:8099/api/record/resolve-intent
+   */
+  async resolveIntent(sessionId: string, instruction: string): Promise<ResolveIntentResponse> {
+    const payload: ResolveIntentRequest = { sessionId, instruction };
+    return await apiClient<ResolveIntentResponse>(
+      `${RECORD_API_BASE_URL}/api/record/resolve-intent`,
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+        timeoutMs: 30000
       }
     );
   }

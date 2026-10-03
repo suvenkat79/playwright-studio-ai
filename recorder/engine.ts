@@ -1,4 +1,5 @@
 import { chromium, Browser, BrowserContext, Frame, Page } from 'playwright';
+import type { StorageState } from 'playwright';
 import { browserInjectionScript } from './locatorGenerator';
 import { ApplicationDetector, ApplicationMetadata, BrowserFacts, RecordedBrowserEvent, RecordingSession } from './types';
 import { extractBrowserFacts } from './browserFacts';
@@ -10,6 +11,7 @@ import { detectFrame } from './frame-detector/engine';
 import { FrameMetadata } from './frame-detector/types';
 import { SmartRecorderEngine } from './smart-recorder/engine';
 import { DetectionContext, IntentEntry, RawLocatorFact, RecordedEvent, RecordedEventType } from './smart-recorder/types';
+import { parseNaturalLanguageIntent, ParsedIntent } from './intentParser';
 
 /**
  * Registered application-detection providers, most-specific first.
@@ -23,12 +25,39 @@ const APPLICATION_PROVIDERS: ApplicationDetector[] = [
   new GenericWebProvider()
 ];
 
-/** True when `b` represents no meaningful change from `a` — compares only
- * the identity fields (pageType/module/entity), not confidence/signals,
- * which can legitimately fluctuate without the page itself having changed.
- * `a` undefined (nothing detected yet) always counts as a change. */
+/**
+ * True when `b` should replace `a` as session.pageMetadata — compares the
+ * identity fields (pageType/module/entity), not confidence/signals, which
+ * can legitimately fluctuate without the page itself having changed. `a`
+ * undefined (nothing detected yet) always counts as a change.
+ *
+ * Root-cause fix (real ServiceNow Classic recording producing Page=Unknown
+ * despite Application/Frame detecting correctly): detectPage()'s "Unknown"
+ * result is PageDetector's fallback for "no provider's candidates scored
+ * above 0" (page-detector/engine.ts), not a provider's considered verdict
+ * that the page is actually unrecognized. PageDetector/FrameDetector
+ * re-run on every 'framenavigated'/'load' event (handleFrameNavigated,
+ * below) — and #gsft_main can legitimately re-navigate mid-session without
+ * a full page reload (a field-change-triggered UI-policy recalculation
+ * reloading the content iframe is a documented real ServiceNow Classic
+ * behavior), briefly landing BrowserFacts on an interim bridge/loading
+ * page that carries none of the route evidence (sys_id, etc.) the
+ * previous, correct detection relied on. Confirmed live and reproduced
+ * directly: without this guard, that transient snapshot unconditionally
+ * overwrote the already-correct "Incident Form" verdict with "Unknown",
+ * and if no further navigation happened to self-correct it before the
+ * next interaction, every event from that point on — including the very
+ * last one, which is what the "most recent" Prepared AI Context summary
+ * displays — was permanently stamped Unknown. An absence of evidence
+ * during a mid-session transition is not evidence that the page changed,
+ * so a fallback "Unknown" verdict must never erase a previously
+ * established, specific one; only another specific (non-fallback) verdict
+ * can.
+ */
 function pageMetadataChanged(a: PageMetadata | undefined, b: PageMetadata): boolean {
-  return !a || a.pageType !== b.pageType || a.module !== b.module || a.entity !== b.entity;
+  if (!a) return true;
+  if (b.pageType === 'Unknown' && a.pageType !== 'Unknown') return false;
+  return a.pageType !== b.pageType || a.module !== b.module || a.entity !== b.entity;
 }
 
 /** Same idea as pageMetadataChanged, for FrameMetadata's identity fields
@@ -48,10 +77,30 @@ function describeRecordedEvent(event: RecordedEvent, intent: IntentEntry): strin
   const subject = event.navigation
     ? `${event.navigation.fromUrl} → ${event.navigation.toUrl} (trigger: ${event.navigation.trigger})`
     : event.locator.text || event.locator.label || event.locator.placeholder || event.locator.id || event.locator.testId || event.value || '(no target)';
-  return `[${event.type}] ${subject} — page: ${event.page.pageType}, frame: ${event.frame.frameType}, intent: ${intent.intent} (${intent.confidence})`;
+  return `[${event.type}] ${subject} — application: ${event.application.application}, ` +
+    `page: ${event.page.pageType}/${event.page.entity ?? 'unknown'}, ` +
+    `frame: ${event.frame.frameType}/${event.frame.frameSelector ?? 'top'}, ` +
+    `locator: ${JSON.stringify(event.locator)}, intent: ${intent.intent} (${intent.confidence})`;
 }
 
-function navigationWaitCode(url: string): string {
+// waitUntil: 'domcontentloaded', not Playwright's default 'load' --
+// root-cause fix for a real, reproducible Execute timeout: confirmed live
+// against a real ServiceNow instance, the post-login top-level navigation
+// lands on the Now Experience shell (nav/ui/classic/params/target/
+// ui_page.do), whose URL matches immediately but whose 'load' event never
+// fires within the 30s timeout (the shell keeps persistent background
+// connections open -- e.g. real-time notification sockets -- which is
+// common to any app with that shape, not unique to ServiceNow). The run's
+// own log showed "navigated to [URL]" (the predicate matched) immediately
+// followed by a full 30000ms TimeoutError, direct proof the URL wait
+// itself was fine and the extra 'load'-state wait was what hung. Every
+// later recorded action is scoped to the frame/content this DOM state
+// already provides (Playwright locators auto-wait for actionability
+// regardless), so there is no loss of correctness in no longer waiting for
+// 'load' specifically.
+const NAVIGATION_WAIT_OPTIONS = "{ waitUntil: 'domcontentloaded' }";
+
+export function navigationWaitCode(url: string): string {
   try {
     const { pathname } = new URL(url);
     const segments = pathname.split('/').filter(Boolean);
@@ -60,12 +109,12 @@ function navigationWaitCode(url: string): string {
 
     if (fragment) {
       const expectedSegment = JSON.stringify(fragment);
-      return `await page.waitForURL(url => url.pathname.split('/').some(segment => segment === ${expectedSegment} || segment.replace(/\\.[a-zA-Z0-9]+$/, '') === ${expectedSegment}));`;
+      return `await page.waitForURL(url => url.pathname.split('/').some(segment => segment === ${expectedSegment} || segment.replace(/\\.[a-zA-Z0-9]+$/, '') === ${expectedSegment}), ${NAVIGATION_WAIT_OPTIONS});`;
     }
 
-    return `await page.waitForURL(url => url.pathname === ${JSON.stringify(pathname)});`;
+    return `await page.waitForURL(url => url.pathname === ${JSON.stringify(pathname)}, ${NAVIGATION_WAIT_OPTIONS});`;
   } catch {
-    return `await page.waitForURL(${JSON.stringify(url)});`;
+    return `await page.waitForURL(${JSON.stringify(url)}, ${NAVIGATION_WAIT_OPTIONS});`;
   }
 }
 
@@ -119,6 +168,51 @@ function frameAwareCodeLine(codeLine: string, frameSelector?: string, type?: Rec
   const frameLocator = `page.frameLocator(${JSON.stringify(frameSelector)})`;
   if (codeLine.startsWith(`await ${frameLocator}.`)) return codeLine;
   return codeLine.replace(/^(\s*await )page\./, (_match, prefix: string) => `${prefix}${frameLocator}.`);
+}
+
+/** mm:ss.ss elapsed since session start — shared by live event capture and
+ * AI Gen's resolveIntent(), so both stamp events on the same clock. */
+function formatElapsedTimestamp(startTime: number): string {
+  const elapsedSeconds = ((Date.now() - startTime) / 1000).toFixed(2);
+  const minutes = Math.floor(Number(elapsedSeconds) / 60);
+  const seconds = (Number(elapsedSeconds) % 60).toFixed(2);
+  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(5, '0')}`;
+}
+
+/** Shape returned by locatorGenerator.ts's browser-injected
+ * resolveElementByText() (window.__playwrightStudioResolveElement) — a
+ * computePlaywrightLocator() result (strategy/selector/display/tag/...)
+ * plus the accessible name that was actually matched. */
+interface ResolvedElementLocator {
+  matchedText: string;
+  strategy: string;
+  selector: string;
+  display: string;
+  tag: string;
+  [key: string]: unknown;
+}
+
+/** Builds the exact same style of Playwright code line the live recorder's
+ * click/fill/select listeners emit (see locatorGenerator.ts) — selectOption
+ * for a <select>, fill for any other field, click otherwise. Keeps AI Gen's
+ * generated actions indistinguishable, at the codegen level, from ones a
+ * human actually recorded. */
+function actionCodeLineForIntent(intent: ParsedIntent, locatorSelector: string, tag: string): string {
+  if (intent.kind === 'click') {
+    return `await ${locatorSelector}.click();`;
+  }
+  const escapedValue = intent.value.replace(/'/g, "\\'");
+  return tag === 'select'
+    ? `await ${locatorSelector}.selectOption('${escapedValue}');`
+    : `await ${locatorSelector}.fill('${escapedValue}');`;
+}
+
+/** 'set' intent resolved to a <select> emits a 'select' event (matching the
+ * real recorder's own select-listener type); any other resolved element
+ * emits 'fill'. A 'click' intent always emits 'click'. */
+function eventTypeForIntent(intent: ParsedIntent, tag: string): RecordedBrowserEvent['type'] {
+  if (intent.kind === 'click') return 'click';
+  return tag === 'select' ? 'select' : 'fill';
 }
 
 export class PlaywrightRecordingEngine {
@@ -238,10 +332,7 @@ export class PlaywrightRecordingEngine {
         frameSelector = await getFrameSelector(frame);
       }
 
-      const elapsedSeconds = ((Date.now() - session.startTime) / 1000).toFixed(2);
-      const minutes = Math.floor(Number(elapsedSeconds) / 60);
-      const seconds = (Number(elapsedSeconds) % 60).toFixed(2);
-      const timestamp = `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(5, '0')}`;
+      const timestamp = formatElapsedTimestamp(session.startTime);
 
       const event: RecordedBrowserEvent = {
         id: `evt_${Date.now()}_${session.events.length + 1}`,
@@ -257,12 +348,6 @@ export class PlaywrightRecordingEngine {
         identitySelector: rawEvent.identitySelector,
         tabIndex: pageIndices.get(frame.page()) ?? 0
       };
-
-      session.events.push(event);
-      if (onEvent) {
-        onEvent(event);
-      }
-      console.log(`[Session ${sessionId}] Captured [${event.type}]: ${event.codeLine}`);
 
       // Smart Recorder (Sprint 5.4) — parallel, additive: records the same
       // interaction as an immutable, framework-agnostic RecordedEvent,
@@ -294,11 +379,22 @@ export class PlaywrightRecordingEngine {
         );
         session.recordedEvents.push(smartEvent);
         session.intentTimeline.push(intent);
+        event.applicationMetadata = smartEvent.application;
+        event.pageMetadata = smartEvent.page;
+        event.frameMetadata = smartEvent.frame;
+        event.smartLocator = smartEvent.locator;
+        event.intent = intent;
         console.log(`[Session ${sessionId}] Event recorded: ${describeRecordedEvent(smartEvent, intent)}`);
         if (onEventRecorded) {
           onEventRecorded(smartEvent, intent);
         }
       }
+
+      session.events.push(event);
+      if (onEvent) {
+        onEvent(event);
+      }
+      console.log(`[Session ${sessionId}] Captured [${event.type}]: ${event.codeLine}`);
     });
 
     // Inject locator generator & event interceptors on every navigation, in
@@ -340,6 +436,28 @@ export class PlaywrightRecordingEngine {
     // just leaves applicationMetadata/pageMetadata/frameMetadata unset.
     try {
       const facts = await extractBrowserFacts(page);
+      const frameSnapshots = await Promise.all(page.frames().map(async (frame) => {
+        let frameSelector: string | undefined;
+        try {
+          frameSelector = await getFrameSelector(frame);
+        } catch {
+          // A frame may detach while the initial detection snapshot is read.
+        }
+        return {
+          url: frame.url(),
+          name: frame.name(),
+          selector: frameSelector ?? null
+        };
+      }));
+      console.log(
+        `[Session ${sessionId}] Initial detection input: ` +
+        JSON.stringify({
+          topLevelUrl: page.url(),
+          frames: frameSnapshots,
+          iframeSrcs: facts.iframeSrcs,
+          liveFrameUrls: facts.frameUrls
+        })
+      );
 
       const metadata = await this.detectApplication(facts);
       session.applicationMetadata = metadata;
@@ -474,7 +592,9 @@ export class PlaywrightRecordingEngine {
   /**
    * Page + frame detection (Sprint 5 Phase 3 lifecycle patch). Called once
    * from startSession right after the initial page load, and again from
-   * handleFrameNavigated on every subsequent main-frame navigation.
+   * handleFrameNavigated on every subsequent frame navigation. ServiceNow
+   * form routing can happen entirely inside #gsft_main without a top-level
+   * navigation, so frame-source changes can refine PageMetadata too.
    * detectPage/detectFrame themselves are unchanged (never redesigned) —
    * this only adds change-detection so pageMetadata/frameMetadata (and the
    * PAGE_DETECTED/FRAME_DETECTED callbacks) only update when the verdict
@@ -508,36 +628,6 @@ export class PlaywrightRecordingEngine {
       session.frameMetadataHistory = Object.freeze([...session.frameMetadataHistory, frameMetadata]);
       console.log(
         `[Session ${sessionId}] Frame detected: ${frameMetadata.frameType}` +
-        (frameMetadata.frameSelector ? ` (${frameMetadata.frameSelector})` : '') +
-        ` — confidence ${frameMetadata.confidence}`
-      );
-      if (onFrameDetected) {
-        onFrameDetected(frameMetadata);
-      }
-    }
-  }
-
-  /**
-   * Frame-only re-detection (Sprint 5 Phase 3 lifecycle patch), for when a
-   * non-main frame navigates on its own — "the active frame changes"
-   * without a page-level navigation having happened, so PageDetector does
-   * not re-run, only FrameDetector does.
-   */
-  private runFrameDetectionOnly(
-    session: RecordingSession,
-    sessionId: string,
-    facts: BrowserFacts,
-    application: ApplicationMetadata,
-    onFrameDetected?: (metadata: FrameMetadata) => void
-  ): void {
-    if (!session.pageMetadata) return; // initial detection hasn't completed yet — nothing to re-check against
-
-    const frameMetadata = detectFrame(facts, application, session.pageMetadata);
-    if (frameMetadataChanged(session.frameMetadata, frameMetadata)) {
-      session.frameMetadata = frameMetadata;
-      session.frameMetadataHistory = Object.freeze([...session.frameMetadataHistory, frameMetadata]);
-      console.log(
-        `[Session ${sessionId}] Frame detected (sub-frame navigation): ${frameMetadata.frameType}` +
         (frameMetadata.frameSelector ? ` (${frameMetadata.frameSelector})` : '') +
         ` — confidence ${frameMetadata.confidence}`
       );
@@ -590,12 +680,6 @@ export class PlaywrightRecordingEngine {
           tabIndex
         };
 
-        session.events.push(navEvent);
-        if (onEvent) {
-          onEvent(navEvent);
-        }
-        console.log(`[Session ${sessionId}] Navigated to: ${frame.url()}`);
-
         // Smart Recorder (Sprint 5.4) — captured at the moment the
         // navigation is observed, per "do not infer later". Uses the
         // Context Engine metadata as it stood just before this navigation
@@ -606,26 +690,30 @@ export class PlaywrightRecordingEngine {
           const { event: navigationEvent, intent } = session.smartRecorder.recordNavigation(lastKnownUrl, frame.url(), context);
           session.recordedEvents.push(navigationEvent);
           session.intentTimeline.push(intent);
+          navEvent.applicationMetadata = navigationEvent.application;
+          navEvent.pageMetadata = navigationEvent.page;
+          navEvent.frameMetadata = navigationEvent.frame;
+          navEvent.smartLocator = navigationEvent.locator;
+          navEvent.intent = intent;
+          navEvent.navigation = navigationEvent.navigation;
           console.log(`[Session ${sessionId}] Event recorded: ${describeRecordedEvent(navigationEvent, intent)}`);
           if (onEventRecorded) {
             onEventRecorded(navigationEvent, intent);
           }
         }
+        session.events.push(navEvent);
+        if (onEvent) {
+          onEvent(navEvent);
+        }
+        console.log(`[Session ${sessionId}] Navigated to: ${frame.url()}`);
         lastKnownUrl = frame.url();
       }
     });
 
     // Page/Frame re-detection lifecycle (Sprint 5 Phase 3 lifecycle patch).
-    // Separate listeners from the event-capture one above — deliberately
-    // not merged into it, so the existing recording/codegen path is
-    // untouched. ApplicationDetector never re-runs (ApplicationMetadata is
-    // captured once, in startSession, and reused as-is here). PageDetector
-    // re-runs on every successful main-frame navigation (URL change, frame
-    // navigation, or document load — 'framenavigated' and 'load' together
-    // cover all three; re-detection is idempotent since it only emits/
-    // records on an actual change, so both listeners firing for the same
-    // navigation is harmless). FrameDetector re-runs whenever PageDetector
-    // runs, or on its own when a non-main frame navigates.
+    // ApplicationDetector remains one-time; PageDetector and FrameDetector
+    // rerun for main- and sub-frame navigation so iframe route changes can
+    // refine page metadata without changing event capture/codegen.
     page.on('framenavigated', (frame) => {
       if (frame.url().startsWith('about:')) return;
       void this.handleFrameNavigated(session, sessionId, page, frame, onPageDetected, onFrameDetected);
@@ -697,10 +785,9 @@ export class PlaywrightRecordingEngine {
   }
 
   /**
-   * Dispatches a 'framenavigated'/'load' event to the right re-detection
-   * path: main-frame navigation re-runs PageDetector (which in turn always
-   * re-runs FrameDetector too, per runPageAndFrameDetection above); a
-   * non-main frame navigating on its own re-runs only FrameDetector.
+   * Re-runs PageDetector and FrameDetector on every navigation. An
+   * application route can change inside an iframe without a top-level
+   * navigation, and page providers can use the updated iframe source facts.
    * ApplicationDetector is deliberately never called from here — it runs
    * exactly once, in startSession. Best-effort, same as the initial
    * detection: a re-detection failure never aborts the session.
@@ -709,19 +796,51 @@ export class PlaywrightRecordingEngine {
     session: RecordingSession,
     sessionId: string,
     page: Page,
-    frame: Frame,
+    navigatedFrame: Frame,
     onPageDetected?: (metadata: PageMetadata) => void,
     onFrameDetected?: (metadata: FrameMetadata) => void
   ): Promise<void> {
-    if (!session.applicationMetadata) return; // initial detection hasn't completed yet
+    if (!session.applicationMetadata) {
+      console.log(`[Session ${sessionId}] Detection skipped before initial application detection completed.`);
+      return;
+    }
 
     try {
-      const facts = await extractBrowserFacts(page);
-      if (frame === page.mainFrame()) {
-        await this.runPageAndFrameDetection(session, sessionId, facts, session.applicationMetadata, onPageDetected, onFrameDetected);
-      } else {
-        this.runFrameDetectionOnly(session, sessionId, facts, session.applicationMetadata, onFrameDetected);
+      let frameSelector: string | undefined;
+      try {
+        frameSelector = await getFrameSelector(navigatedFrame);
+      } catch {
+        // Navigation can detach the frame before its element selector is read.
       }
+      const facts = await extractBrowserFacts(page);
+      console.log(
+        `[Session ${sessionId}] Navigation detection input: ` +
+        JSON.stringify({
+          topLevelUrl: page.url(),
+          frameUrl: navigatedFrame.url(),
+          frameName: navigatedFrame.name(),
+          frameSelector: frameSelector ?? null,
+          iframeSrcs: facts.iframeSrcs,
+          liveFrameUrls: facts.frameUrls,
+          application: session.applicationMetadata
+        })
+      );
+      await this.runPageAndFrameDetection(
+        session,
+        sessionId,
+        facts,
+        session.applicationMetadata,
+        onPageDetected,
+        onFrameDetected
+      );
+      console.log(
+        `[Session ${sessionId}] Navigation detection result: ` +
+        JSON.stringify({
+          application: session.applicationMetadata,
+          page: session.pageMetadata,
+          frame: session.frameMetadata
+        })
+      );
     } catch (e: any) {
       console.warn(`[Session ${sessionId}] Re-detection notice: ${e.message}`);
     }
@@ -738,11 +857,246 @@ export class PlaywrightRecordingEngine {
   /**
    * Stops recording session and closes Chromium browser
    */
-  async stopSession(sessionId: string): Promise<{ testScript: string; totalEvents: number }> {
+  /**
+   * AI Gen's only entry point into a real browser. Resolves a natural-
+   * language instruction against the live page of an active session,
+   * reusing the same Context Engine metadata (Application/Page/Frame) and
+   * the same computePlaywrightLocator() the live click/fill listeners use
+   * — via resolveElementByText()/window.__playwrightStudioResolveElement
+   * in locatorGenerator.ts — instead of inventing a selector. Requires an
+   * active session; callers with no live session should show that state
+   * rather than calling this.
+   *
+   * Returns one RecordedBrowserEvent per clause that resolved to a real
+   * element — the exact same shape the live recorder emits, so it can be
+   * handed straight to the existing optimizer/spec-generator pipeline
+   * unchanged — plus the raw text of every clause that could not be parsed
+   * or could not be matched to any element on the page, so a caller can be
+   * honest about what AI Gen did not understand rather than silently
+   * guessing.
+   */
+  async resolveIntent(sessionId: string, instruction: string): Promise<{
+    actions: RecordedBrowserEvent[];
+    unresolved: string[];
+  }> {
     const session = this.sessions.get(sessionId);
-    if (!session) {
-      throw new Error(`Session ${sessionId} not found`);
+    if (!session || !session.isActive) {
+      throw new Error(`No active recording session "${sessionId}" to resolve intent against.`);
     }
+
+    const context = this.getDetectionContext(session);
+    const { intents, unparsed } = parseNaturalLanguageIntent(instruction);
+
+    const actions: RecordedBrowserEvent[] = [];
+    const unresolved: string[] = [...unparsed];
+
+    for (const intent of intents) {
+      const resolved = await this.resolveIntentAgainstPage(session.page, intent);
+      if (!resolved) {
+        unresolved.push(intent.raw);
+        continue;
+      }
+
+      const { locator, frameSelector } = resolved;
+      const type = eventTypeForIntent(intent, locator.tag);
+      const codeLine = frameAwareCodeLine(
+        actionCodeLineForIntent(intent, locator.selector, locator.tag),
+        frameSelector,
+        type
+      );
+
+      actions.push({
+        id: `ai_${Date.now()}_${actions.length + 1}`,
+        type,
+        selector: locator.selector,
+        value: intent.kind === 'set' ? intent.value : undefined,
+        timestamp: formatElapsedTimestamp(session.startTime),
+        codeLine,
+        url: session.page.url(),
+        frameSelector,
+        tabIndex: 0,
+        applicationMetadata: context?.application,
+        pageMetadata: context?.page,
+        frameMetadata: context?.frame
+      });
+    }
+
+    return { actions, unresolved };
+  }
+
+  /**
+   * Finds which real element (if any) a single parsed intent's target text
+   * refers to, trying the main frame first and then every child frame in
+   * turn (a ServiceNow-style app keeps its real fields inside an iframe
+   * such as #gsft_main) — via the same injected
+   * window.__playwrightStudioResolveElement() the browser-side locator
+   * engine exposes, so there is no separate DOM-matching logic here.
+   */
+  private async resolveIntentAgainstPage(
+    page: Page,
+    intent: ParsedIntent
+  ): Promise<{ locator: ResolvedElementLocator; frameSelector?: string } | undefined> {
+    const tagFilter = intent.kind === 'set' ? 'input, select, textarea' : undefined;
+    const mainFrame = page.mainFrame();
+    const frames = [mainFrame, ...page.frames().filter((frame) => frame !== mainFrame)];
+
+    for (const frame of frames) {
+      if (frame.isDetached()) continue;
+
+      let result: ResolvedElementLocator | null;
+      try {
+        result = await frame.evaluate(
+          ({ searchText, tagFilter }) => (window as any).__playwrightStudioResolveElement(searchText, tagFilter),
+          { searchText: intent.target, tagFilter }
+        );
+      } catch {
+        continue; // cross-origin, detached mid-evaluate, or script not yet injected — try the next frame
+      }
+      if (!result) continue;
+
+      const frameSelector = await getFrameSelector(frame);
+      return { locator: result, frameSelector };
+    }
+
+    return undefined;
+  }
+
+  /**
+   * Launches a short-lived, NON-recording browser purely for GenAI's live-
+   * DOM resolution (Phase 1 of GenAI consuming Record/Optimize/Framework
+   * Generator output — see project architecture notes). Reuses exactly the
+   * same browser injection script and Context Engine (detectApplication/
+   * runPageAndFrameDetection) startSession() uses, so resolveIntent() works
+   * against the resulting session completely unchanged. Deliberately skips
+   * everything that makes a session a *recording*: no
+   * context.exposeBinding('__playwrightStudioEmitEvent', ...) (so the
+   * injected script's own click/fill listeners have nothing to call into —
+   * no human-interaction capture happens), no Smart Recorder interaction
+   * recording, no attachPageListeners (no recorder dialog/download/
+   * navigation capture).
+   *
+   * Refuses to launch while any real recording session is still active
+   * (any active session whose `kind` is not 'resolution') — GenAI's own
+   * browser must never run concurrently with a live recording.
+   */
+  async startResolutionSession(
+    targetUrl: string,
+    headless = true,
+    requestedSessionId?: string,
+    storageState?: StorageState
+  ): Promise<string> {
+    const activeRecording = [...this.sessions.values()]
+      .find((session) => session.isActive && session.kind !== 'resolution');
+    if (activeRecording) {
+      throw new Error(
+        `Cannot start a resolution session while recording session "${activeRecording.id}" is active. Stop the recording first.`
+      );
+    }
+
+    const sessionId = requestedSessionId ??
+      `res_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+    const formattedUrl = targetUrl.startsWith('http://') || targetUrl.startsWith('https://')
+      ? targetUrl
+      : `https://${targetUrl}`;
+
+    console.log(`[PlaywrightRecordingEngine] Launching resolution browser for session: ${sessionId}`);
+    console.log(`[PlaywrightRecordingEngine] Target URL: ${formattedUrl}`);
+
+    const browser: Browser = await chromium.launch({
+      headless,
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled']
+    });
+    const context: BrowserContext = await browser.newContext({
+      ...(storageState ? { storageState } : {}),
+      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+    });
+    const page: Page = await context.newPage();
+
+    // Same browser-injected locator engine the recording session uses --
+    // required for resolveIntent()'s window.__playwrightStudioResolveElement
+    // to exist in this page. No exposeBinding alongside it, unlike
+    // startSession(): the injected script's own DOM listeners call
+    // window.__playwrightStudioEmitEvent when a human interacts with the
+    // page, but that function is only ever defined by exposeBinding -- by
+    // never calling it here, there is nothing for those listeners to call
+    // into, so no interaction capture can happen in this browser.
+    await context.addInitScript(browserInjectionScript);
+
+    // Best-effort auto-cleanup if the browser closes/crashes on its own
+    // (e.g. the process is killed externally) — not recorder dialog/
+    // download capture (attachPageListeners), just housekeeping so a dead
+    // session entry never lingers in the map.
+    browser.on('disconnected', () => {
+      const current = this.sessions.get(sessionId);
+      if (current && current.kind === 'resolution') {
+        current.isActive = false;
+        this.sessions.delete(sessionId);
+      }
+    });
+
+    const session: RecordingSession = {
+      id: sessionId,
+      targetUrl: formattedUrl,
+      startTime: Date.now(),
+      browser,
+      context,
+      page,
+      events: [],
+      isActive: true,
+      applicationMetadataHistory: [],
+      pageMetadataHistory: [],
+      frameMetadataHistory: [],
+      recordedEvents: [],
+      intentTimeline: [],
+      smartRecorder: new SmartRecorderEngine(),
+      kind: 'resolution'
+    };
+    this.sessions.set(sessionId, session);
+
+    try {
+      await page.goto(formattedUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    } catch (e: any) {
+      console.warn(`[Session ${sessionId}] Resolution session navigation notice: ${e.message}`);
+    }
+
+    // Same one-time Application/Page/Frame detection startSession() runs --
+    // no duplicate detection logic, no second ApplicationDetector/
+    // PageDetector/FrameDetector.
+    try {
+      const facts = await extractBrowserFacts(page);
+      const metadata = await this.detectApplication(facts);
+      session.applicationMetadata = metadata;
+      session.applicationMetadataHistory = Object.freeze([metadata]);
+      console.log(
+        `[Session ${sessionId}] Application detected: ${metadata.application}` +
+        (metadata.ui ? ` (${metadata.ui})` : '') +
+        ` — confidence ${metadata.confidence}`
+      );
+      await this.runPageAndFrameDetection(session, sessionId, facts, metadata);
+    } catch (e: any) {
+      console.warn(`[Session ${sessionId}] Resolution session detection notice: ${e.message}`);
+    }
+
+    return sessionId;
+  }
+
+  /** Direct Page access for a session — primarily for resolution sessions
+   * (see startResolutionSession()), which have no event-stream callbacks to
+   * observe state through otherwise. */
+  getPage(sessionId: string): Page | undefined {
+    return this.sessions.get(sessionId)?.page;
+  }
+
+  /**
+   * Closes a resolution session's browser and removes it from the session
+   * map. Resolution sessions are meant to be short-lived — callers should
+   * close one as soon as whatever it was opened to resolve is done. A
+   * no-op for anything that isn't an active resolution session (including
+   * real recording sessions — use stopSession() for those).
+   */
+  async closeResolutionSession(sessionId: string): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.kind !== 'resolution') return;
 
     session.isActive = false;
 
@@ -751,13 +1105,40 @@ export class PlaywrightRecordingEngine {
         await session.browser.close();
       }
     } catch (err: any) {
-      console.warn(`[Session ${sessionId}] Error closing browser:`, err.message);
+      console.warn(`[Session ${sessionId}] Error closing resolution browser:`, err.message);
+    }
+    this.sessions.delete(sessionId);
+  }
+
+  async stopSession(sessionId: string): Promise<{
+    testScript: string;
+    totalEvents: number;
+    storageState: StorageState;
+  }> {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      throw new Error(`Session ${sessionId} not found`);
+    }
+
+    session.isActive = false;
+    let storageState: StorageState;
+    try {
+      storageState = await session.context.storageState();
+    } finally {
+      try {
+        if (session.browser) {
+          await session.browser.close();
+        }
+      } catch (err: any) {
+        console.warn(`[Session ${sessionId}] Error closing browser:`, err.message);
+      }
     }
 
     const testScript = this.generatePlaywrightSpec(session);
     return {
       testScript,
-      totalEvents: session.events.length
+      totalEvents: session.events.length,
+      storageState
     };
   }
 

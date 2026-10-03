@@ -1,6 +1,7 @@
 package com.playwrightstudio.record.dto;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.databind.JsonNode;
 
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class RecordedActionDto {
@@ -16,6 +17,12 @@ public class RecordedActionDto {
     private String variableName;
     private String identitySelector;
     private int tabIndex;
+    private JsonNode applicationMetadata;
+    private JsonNode pageMetadata;
+    private JsonNode frameMetadata;
+    private JsonNode smartLocator;
+    private JsonNode intent;
+    private JsonNode navigation;
 
     public RecordedActionDto() {}
 
@@ -64,4 +71,22 @@ public class RecordedActionDto {
 
     public int getTabIndex() { return tabIndex; }
     public void setTabIndex(int tabIndex) { this.tabIndex = tabIndex; }
+
+    public JsonNode getApplicationMetadata() { return applicationMetadata; }
+    public void setApplicationMetadata(JsonNode applicationMetadata) { this.applicationMetadata = applicationMetadata; }
+
+    public JsonNode getPageMetadata() { return pageMetadata; }
+    public void setPageMetadata(JsonNode pageMetadata) { this.pageMetadata = pageMetadata; }
+
+    public JsonNode getFrameMetadata() { return frameMetadata; }
+    public void setFrameMetadata(JsonNode frameMetadata) { this.frameMetadata = frameMetadata; }
+
+    public JsonNode getSmartLocator() { return smartLocator; }
+    public void setSmartLocator(JsonNode smartLocator) { this.smartLocator = smartLocator; }
+
+    public JsonNode getIntent() { return intent; }
+    public void setIntent(JsonNode intent) { this.intent = intent; }
+
+    public JsonNode getNavigation() { return navigation; }
+    public void setNavigation(JsonNode navigation) { this.navigation = navigation; }
 }

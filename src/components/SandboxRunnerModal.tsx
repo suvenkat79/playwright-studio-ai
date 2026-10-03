@@ -9,6 +9,15 @@ interface SandboxRunnerModalProps {
   initialUrl?: string;
   initialHeadless?: boolean;
   suiteFiles: SuiteFile[];
+  /** The suite file currently selected/active elsewhere in the app (e.g.
+   * App.tsx's activeFileId — whatever the user just added via "Add to
+   * Suite Files", or has open in the Projects file tabs). When this points
+   * at a real `category: 'test'` suite file, Run Test executes that file
+   * instead of guessing one of the two hardcoded demo specs by URL. Falls
+   * back to the original demo-preset behavior when unset or pointing at a
+   * non-test file (a POM, config, etc.) — the Awwwards/Incident presets
+   * keep working exactly as before. */
+  preferredSpecId?: string;
 }
 
 /** Maps a backend RunStepDto onto the TestStep shape the existing Steps/Visual tabs already render. */
@@ -62,7 +71,8 @@ export const SandboxRunnerModal: React.FC<SandboxRunnerModalProps> = ({
   onClose,
   initialUrl = 'https://www.awwwards.com/websites/e-commerce/',
   initialHeadless = false,
-  suiteFiles
+  suiteFiles,
+  preferredSpecId
 }) => {
   const [runId, setRunId] = useState<string | null>(null);
   const [runStatus, setRunStatus] = useState<RunLifecycleStatus | null>(null);
@@ -87,12 +97,22 @@ export const SandboxRunnerModal: React.FC<SandboxRunnerModalProps> = ({
 
   const isAwwwards = targetUrl.includes('awwwards.com');
 
-  // Which real suite files (spec + its POM dependency) this target maps to.
-  // The two real specs already in INITIAL_SUITE_FILES are the only ones
-  // wired for real execution — matches the same isAwwwards branch the
-  // Visual Preview tab's cosmetic reproduction already keys off of.
-  const specId = isAwwwards ? 'awwwards-ecommerce.spec.ts' : 'incident-e2e.spec.ts';
-  const pomId = isAwwwards ? 'AwwwardsEcommercePage.ts' : 'IncidentManagementPage.ts';
+  // Whatever suite file is actually selected elsewhere in the app (e.g.
+  // just added via "Add to Suite Files") wins whenever it's a real,
+  // runnable test file — this is what actually executes, not a guess.
+  const preferredSpec = preferredSpecId
+    ? suiteFiles.find((f) => f.id === preferredSpecId && f.category === 'test')
+    : undefined;
+
+  // Fallback when nothing real is selected: the two demo specs already in
+  // INITIAL_SUITE_FILES, matching the same isAwwwards branch the Visual
+  // Preview tab's cosmetic reproduction keys off of. AI Gen/Recorder-
+  // generated specs are fully self-contained (no separate POM import), so
+  // a preferred spec never has a companion pomId.
+  const fallbackSpecId = isAwwwards ? 'awwwards-ecommerce.spec.ts' : 'incident-e2e.spec.ts';
+  const fallbackPomId = isAwwwards ? 'AwwwardsEcommercePage.ts' : 'IncidentManagementPage.ts';
+  const specId = preferredSpec?.id ?? fallbackSpecId;
+  const pomId = preferredSpec ? undefined : fallbackPomId;
 
   const [steps, setSteps] = useState<TestStep[]>([]);
   // Raw step DTOs alongside the TestStep-mapped `steps` above — kept
@@ -949,9 +969,7 @@ export const SandboxRunnerModal: React.FC<SandboxRunnerModalProps> = ({
                 <button
                   onClick={() =>
                     navigator.clipboard.writeText(
-                      `npx playwright test ${
-                        isAwwwards ? 'tests/awwwards-ecommerce.spec.ts' : 'tests/incident-e2e.spec.ts'
-                      } ${headlessMode ? '' : '--headed'}`
+                      `npx playwright test tests/${specId} ${headlessMode ? '' : '--headed'}`
                     )
                   }
                   className="hover:text-[#dfe2ee] text-[#4cd7f6] flex items-center gap-1 cursor-pointer"
@@ -981,7 +999,7 @@ export const SandboxRunnerModal: React.FC<SandboxRunnerModalProps> = ({
             </span>
             <span>CLI Command:</span>
             <code className="text-[#dfe2ee] bg-[#11141c] px-2 py-0.5 rounded border border-[#262a33]">
-              npx playwright test {isAwwwards ? 'tests/awwwards-ecommerce.spec.ts' : 'tests/incident-e2e.spec.ts'} {!headlessMode ? '--headed' : ''}
+              npx playwright test tests/{specId} {!headlessMode ? '--headed' : ''}
             </code>
           </div>
 
@@ -1010,9 +1028,7 @@ export const SandboxRunnerModal: React.FC<SandboxRunnerModalProps> = ({
             <button
               onClick={() => {
                 navigator.clipboard.writeText(
-                  `npx playwright test ${
-                    isAwwwards ? 'tests/awwwards-ecommerce.spec.ts' : 'tests/incident-e2e.spec.ts'
-                  } ${!headlessMode ? '--headed' : ''}`
+                  `npx playwright test tests/${specId} ${!headlessMode ? '--headed' : ''}`
                 );
               }}
               className="px-3 py-1 rounded bg-[#262a33] hover:bg-[#31353e] text-[#dfe2ee] transition-colors cursor-pointer"

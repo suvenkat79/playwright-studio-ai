@@ -167,15 +167,17 @@ function toFrameAliasedLocator(
   frameAliases: Map<string, string>,
   pagePrefix: string = 'page'
 ): string {
+  let aliasedSelector = selector;
   if (frameSelector) {
     const alias = frameAliases.get(frameSelector);
     if (!alias) return selector;
     const frameLocator = `page.frameLocator(${JSON.stringify(frameSelector)})`;
-    return selector.startsWith(`${frameLocator}.`)
-      ? selector.replace(`${frameLocator}.`, `${alias}.`)
-      : selector.replace(/^page\./, `${alias}.`);
+    aliasedSelector = aliasedSelector.replaceAll(`${frameLocator}.`, `${alias}.`);
+    return aliasedSelector.replace(/\bpage\.(?=[A-Za-z_$][\w$]*(?:\(|\.))/g, `${alias}.`);
   }
-  return pagePrefix !== 'page' ? selector.replace(/^page\./, `${pagePrefix}.`) : selector;
+  return pagePrefix !== 'page'
+    ? aliasedSelector.replace(/\bpage\.(?=[A-Za-z_$][\w$]*(?:\(|\.))/g, `${pagePrefix}.`)
+    : aliasedSelector;
 }
 
 /**
@@ -419,6 +421,17 @@ export function generateOptimizedSpec(actions: OptimizedAction[], targetUrl: str
       return '';
     }
 
+    if (action.type === 'navigation' && action.tabIndex > 0) {
+      const pageVar = pagePrefixFor(action.tabIndex);
+      const aliasedCodeLine = toFrameAliasedLocator(
+        action.codeLine,
+        undefined,
+        frameAliases,
+        pageVar
+      );
+      return aliasedCodeLine ? `  ${aliasedCodeLine}` : '';
+    }
+
     const opensNewTabIndex = tabOpenerNewIndex.get(index);
     if (opensNewTabIndex !== undefined && action.type === 'click') {
       const pageVar = pageAliases.get(opensNewTabIndex)!;
@@ -445,16 +458,6 @@ export function generateOptimizedSpec(actions: OptimizedAction[], targetUrl: str
       );
     }
 
-    if (action.type === 'navigation' && action.tabIndex > 0) {
-      const previousActionAny = actions[index - 1];
-      const isFirstOnThisTab = !previousActionAny || previousActionAny.tabIndex !== action.tabIndex;
-      if (isFirstOnThisTab && action.codeLine) {
-        const pageVar = pagePrefixFor(action.tabIndex);
-        const aliasedCodeLine = action.codeLine.replace(/^await page\./, `await ${pageVar}.`);
-        return `  ${aliasedCodeLine}`;
-      }
-    }
-
     if (action.type === 'navigation') {
       const previousAction = actions.slice(0, index).reverse().find((item) => item.type !== 'navigation');
       const nextAction = actions.slice(index + 1).find((item) => item.type !== 'navigation');
@@ -464,10 +467,11 @@ export function generateOptimizedSpec(actions: OptimizedAction[], targetUrl: str
       if (!frameSelector && action.codeLine && nextAction?.frameSelector) {
         const nextFrameAlias = frameAliases.get(nextAction.frameSelector);
         if (nextFrameAlias) {
-          const frameLocator = `page.frameLocator(${JSON.stringify(nextAction.frameSelector)})`;
-          const locator = nextAction.selector.startsWith(`${frameLocator}.`)
-            ? nextAction.selector.replace(`${frameLocator}.`, `${nextFrameAlias}.`)
-            : nextAction.selector.replace(/^page\./, `${nextFrameAlias}.`);
+          const locator = toFrameAliasedLocator(
+            nextAction.selector,
+            nextAction.frameSelector,
+            frameAliases
+          );
           const visibleLocator = visibleFirstLocator(nextAction, locator);
           const iframeLoadWait =
             `  await page.locator(${JSON.stringify(nextAction.frameSelector)}).evaluate((element) => new Promise<void>((resolve) => {\n` +
@@ -500,10 +504,11 @@ export function generateOptimizedSpec(actions: OptimizedAction[], targetUrl: str
             (item) => item.frameSelector === frameSelector && isSubmitButton(item)
           );
           if (capturedSubmitButton) {
-            const frameLocator = `page.frameLocator(${JSON.stringify(frameSelector)})`;
-            const locator = capturedSubmitButton.selector.startsWith(`${frameLocator}.`)
-              ? capturedSubmitButton.selector.replace(`${frameLocator}.`, `${frameAlias}.`)
-              : capturedSubmitButton.selector.replace(/^page\./, `${frameAlias}.`);
+            const locator = toFrameAliasedLocator(
+              capturedSubmitButton.selector,
+              frameSelector,
+              frameAliases
+            );
             // Keep the real URL wait (action.codeLine) ahead of the
             // readiness assertion — see the note on the incident_list.do
             // branch below for why: an assertion alone doesn't confirm we
@@ -522,10 +527,11 @@ export function generateOptimizedSpec(actions: OptimizedAction[], targetUrl: str
           );
 
           if (capturedNewButton) {
-            const frameLocator = `page.frameLocator(${JSON.stringify(frameSelector)})`;
-            const locator = capturedNewButton.selector.startsWith(`${frameLocator}.`)
-              ? capturedNewButton.selector.replace(`${frameLocator}.`, `${frameAlias}.`)
-              : capturedNewButton.selector.replace(/^page\./, `${frameAlias}.`);
+            const locator = toFrameAliasedLocator(
+              capturedNewButton.selector,
+              frameSelector,
+              frameAliases
+            );
             const urlWait = buildUrlWait(action, previousAction);
             return `${urlWait}  await expect(${locator}).toBeVisible();`;
           }
@@ -555,10 +561,11 @@ export function generateOptimizedSpec(actions: OptimizedAction[], targetUrl: str
             : undefined;
 
         if (targetSelector) {
-          const frameLocator = `page.frameLocator(${JSON.stringify(frameSelector)})`;
-          const locator = targetSelector.startsWith(`${frameLocator}.`)
-            ? targetSelector.replace(`${frameLocator}.`, `${frameAlias}.`)
-            : targetSelector.replace(/^page\./, `${frameAlias}.`);
+          const locator = toFrameAliasedLocator(
+            targetSelector,
+            frameSelector,
+            frameAliases
+          );
           const readinessLocator = nextAction
             ? visibleFirstLocator(
                 nextAction,
@@ -599,17 +606,13 @@ export function generateOptimizedSpec(actions: OptimizedAction[], targetUrl: str
 
     let codeLine = action.codeLine;
     if (action.frameSelector && action.type !== 'press') {
-      const frameLocator = `page.frameLocator(${JSON.stringify(action.frameSelector)})`;
-      if (!codeLine.startsWith(`await ${frameLocator}.`)) {
-        codeLine = codeLine.replace(/^(\s*await )page\./, (_match, prefix: string) => `${prefix}${frameLocator}.`);
-      }
-      codeLine = codeLine.replace(`await ${frameLocator}.`, `await ${frameAliases.get(action.frameSelector)}.`);
+      codeLine = toFrameAliasedLocator(codeLine, action.frameSelector, frameAliases);
 
       if (action.type === 'click' && /name:\s*\//.test(codeLine)) {
         codeLine = codeLine.replace(/\.click\(\);?$/, '.first().click();');
       }
     } else if (pagePrefix !== 'page') {
-      codeLine = codeLine.replace(/^(\s*await )page\./, (_match, prefix: string) => `${prefix}${pagePrefix}.`);
+      codeLine = toFrameAliasedLocator(codeLine, undefined, frameAliases, pagePrefix);
     }
     if (isSubmitButton(action)) {
       codeLine = codeLine.replace(/\.click\(\);?$/, '.first().click();');

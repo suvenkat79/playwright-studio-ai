@@ -2,6 +2,9 @@ import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { RecordedAction, NavigationTab, RunLifecycleStatus } from '../types';
 import { useRecording } from '../context/RecordingContext';
 import { optimizeRecordedActions, generateOptimizedSpec } from '../services/optimizerService';
+import type { OptimizedAction } from '../services/optimizer/types';
+import { generateFrameworkProject, type FrameworkProject } from '../services/frameworkGenerator';
+import { downloadFrameworkZip } from '../utils/frameworkZip';
 import { runService } from '../services/runService';
 import { CredentialManagerModal, CredentialManagerValues } from './CredentialManagerModal';
 
@@ -115,7 +118,15 @@ export const LiveRecorderView: React.FC<LiveRecorderViewProps> = ({
     canStop,
     startRecording,
     stopRecording,
-    prepareForAIGeneration
+    prepareFrameworkForAIGeneration,
+    preparedFrameworkContext,
+    frameworkProjectId,
+    savedFrameworkProjects,
+    saveFrameworkProject,
+    loadFrameworkProject,
+    frameworkReviewState,
+    frameworkValidationState,
+    runFrameworkValidation
   } = useRecording();
 
   const [activePreset, setActivePreset] = useState<AppPresetType>('incident');
@@ -151,6 +162,9 @@ export const LiveRecorderView: React.FC<LiveRecorderViewProps> = ({
       // output — it was derived from a different (now stale) snapshot.
       setOptimizedScript(null);
       setOptimizedStepCount(null);
+      setOptimizedActions(null);
+      setFrameworkProject(null);
+      setIsFrameworkStructureOpen(false);
     }
   }, [capturedEvents]);
 
@@ -220,6 +234,28 @@ export const LiveRecorderView: React.FC<LiveRecorderViewProps> = ({
   const [copiedCode, setCopiedCode] = useState(false);
   const [optimizedScript, setOptimizedScript] = useState<string | null>(null);
   const [optimizedStepCount, setOptimizedStepCount] = useState<number | null>(null);
+  const [optimizedActions, setOptimizedActions] = useState<OptimizedAction[] | null>(null);
+  const [frameworkProject, setFrameworkProject] = useState<FrameworkProject | null>(null);
+  const [isGeneratingFramework, setIsGeneratingFramework] = useState(false);
+  const [isFrameworkStructureOpen, setIsFrameworkStructureOpen] = useState(false);
+
+  // Download ZIP and View Structure must always reflect the SAME
+  // accumulated FrameworkProject Add to Suite modifies (requirement: no
+  // second, divergent project). preparedFrameworkContext.project is the
+  // single source of truth -- it starts as this view's own
+  // generateFrameworkProject() output, then gets replaced in place by
+  // RecordingContext's addGeneratedProjectToSuite every time AI Gen's "Add
+  // to Suite" merges a new test in, so this view's own display state stays
+  // current without owning the accumulation itself.
+  useEffect(() => {
+    if (preparedFrameworkContext) {
+      setFrameworkProject(preparedFrameworkContext.project);
+    }
+  }, [preparedFrameworkContext]);
+  const optimizedReductionPercent =
+    optimizedStepCount !== null && recordedActions.length > 0
+      ? Math.round(((recordedActions.length - optimizedStepCount) / recordedActions.length) * 100)
+      : null;
   const [isCredentialModalOpen, setIsCredentialModalOpen] = useState(false);
   const [executeRunId, setExecuteRunId] = useState<string | null>(null);
   const [executeStatus, setExecuteStatus] = useState<RunLifecycleStatus | null>(null);
@@ -240,6 +276,10 @@ export const LiveRecorderView: React.FC<LiveRecorderViewProps> = ({
       codeLine
     };
     setRecordedActions((prev) => [...prev, newAction]);
+    setOptimizedActions(null);
+    setOptimizedScript(null);
+    setOptimizedStepCount(null);
+    setFrameworkProject(null);
   };
 
   // Switch URL / Preset
@@ -254,6 +294,10 @@ export const LiveRecorderView: React.FC<LiveRecorderViewProps> = ({
     setTargetUrl(newUrl);
     setInputUrl(newUrl);
     setRecordedActions([]);
+    setOptimizedActions(null);
+    setOptimizedScript(null);
+    setOptimizedStepCount(null);
+    setFrameworkProject(null);
     setTicketCreated(false);
     setOrderPlaced(false);
     setMemberInvited(false);
@@ -269,6 +313,10 @@ export const LiveRecorderView: React.FC<LiveRecorderViewProps> = ({
     setTargetUrl(urlToUse);
     setActivePreset('custom');
     setRecordedActions([]);
+    setOptimizedActions(null);
+    setOptimizedScript(null);
+    setOptimizedStepCount(null);
+    setFrameworkProject(null);
     setCustomActionTriggered(false);
 
     try {
@@ -298,18 +346,6 @@ export const LiveRecorderView: React.FC<LiveRecorderViewProps> = ({
     }
   };
 
-  const handlePrepareForAI = () => {
-    if (recordedActions.length === 0) {
-      onToast?.('Please record some actions before preparing for AI generation.', 'info');
-      return;
-    }
-    prepareForAIGeneration(recordedActions, targetUrl);
-    onToast?.('Captured actions prepared for AI generation! Switching tab...', 'success');
-    if (onNavigateToTab) {
-      onNavigateToTab('ai-gen');
-    }
-  };
-
   const handleUrlSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     await handleStartRecordingSession();
@@ -323,6 +359,8 @@ export const LiveRecorderView: React.FC<LiveRecorderViewProps> = ({
     setCustomActionTriggered(false);
     setOptimizedScript(null);
     setOptimizedStepCount(null);
+    setOptimizedActions(null);
+    setFrameworkProject(null);
   };
 
   /** Runs the Optimizer Pipeline against the current recorded events and
@@ -336,12 +374,61 @@ export const LiveRecorderView: React.FC<LiveRecorderViewProps> = ({
     }
     const optimized = optimizeRecordedActions(recordedActions);
     const spec = generateOptimizedSpec(optimized, targetUrl);
+    setOptimizedActions(optimized);
     setOptimizedScript(spec);
     setOptimizedStepCount(optimized.length);
     onToast?.(
       `Optimized ${recordedActions.length} recorded event(s) into ${optimized.length} step(s).`,
       'success'
     );
+  };
+
+  const handleGenerateFramework = async () => {
+    if (recordedActions.length === 0) {
+      onToast?.('Please record some actions before generating a framework.', 'info');
+      return;
+    }
+
+    setIsGeneratingFramework(true);
+    try {
+      const optimized = optimizedActions ?? optimizeRecordedActions(recordedActions);
+      if (optimizedActions === null) setOptimizedActions(optimized);
+      setOptimizedStepCount(optimized.length);
+      const project = generateFrameworkProject(recordedActions, optimized, targetUrl);
+      const projectId = await saveFrameworkProject(project, undefined, null, targetUrl);
+      prepareFrameworkForAIGeneration(project, recordedActions, optimized, targetUrl, projectId);
+      setFrameworkProject(project);
+      setIsFrameworkStructureOpen(false);
+      onToast?.(`Framework generated with ${project.metadata.generatedFileCount} files.`, 'success');
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : 'Unknown framework generation error';
+      onToast?.(`Framework generation failed: ${message}`, 'error');
+    } finally {
+      setIsGeneratingFramework(false);
+    }
+  };
+
+  const handleDownloadFramework = async () => {
+    if (!frameworkProject) return;
+    try {
+      await downloadFrameworkZip(frameworkProject.files);
+      onToast?.('Framework ZIP downloaded.', 'success');
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : 'Unknown ZIP download error';
+      onToast?.(`Framework ZIP download failed: ${message}`, 'error');
+    }
+  };
+
+  /** "Validate Framework": the deterministic structural/build/type gate —
+   * never the AI Framework Review step, which has no logic yet. */
+  const handleValidateFramework = async () => {
+    await runFrameworkValidation();
+  };
+
+  const handleContinueToAITestGeneration = () => {
+    if (onNavigateToTab) {
+      onNavigateToTab('ai-gen');
+    }
   };
 
   const rawGeneratedScript =
@@ -371,7 +458,8 @@ ${
       return;
     }
     if (!optimizedScript) {
-      const optimized = optimizeRecordedActions(recordedActions);
+      const optimized = optimizedActions ?? optimizeRecordedActions(recordedActions);
+      if (optimizedActions === null) setOptimizedActions(optimized);
       setOptimizedScript(generateOptimizedSpec(optimized, targetUrl));
       setOptimizedStepCount(optimized.length);
     }
@@ -570,6 +658,24 @@ ${
         </div>
 
         <div className="flex items-center gap-2">
+          <select
+            aria-label="Load saved framework project"
+            value={frameworkProjectId ?? ''}
+            onChange={(event) => {
+              if (!event.target.value) return;
+              void loadFrameworkProject(event.target.value).then(() => {
+                onToast?.('Framework project loaded.', 'success');
+              }).catch((error: unknown) => {
+                onToast?.(error instanceof Error ? error.message : 'Failed to load framework project.', 'error');
+              });
+            }}
+            className="max-w-52 rounded border border-white/15 bg-[#181c24] px-2 py-2 text-xs text-[#dfe2ee]"
+          >
+            <option value="">Open saved project…</option>
+            {savedFrameworkProjects.map((saved) => (
+              <option key={saved.projectId} value={saved.projectId}>{saved.name}</option>
+            ))}
+          </select>
           <button
             onClick={handleClear}
             className="px-2.5 py-1.5 rounded-lg bg-[#262a33] hover:bg-[#31353e] text-xs font-mono text-[#c7c4d7] hover:text-[#dfe2ee] transition-colors cursor-pointer"
@@ -606,14 +712,22 @@ ${
             <span>Optimize</span>
           </button>
           <button
-            onClick={handlePrepareForAI}
-            className="px-3.5 py-1.5 rounded-lg bg-[#6750a4]/30 hover:bg-[#6750a4]/45 border border-[#c0c1ff]/30 text-[#dfe2ee] text-xs font-semibold font-mono flex items-center gap-1.5 transition-all cursor-pointer shadow-sm"
-            title="Prepare captured events for AI Generation"
+            onClick={handleGenerateFramework}
+            disabled={isGeneratingFramework || frameworkProject !== null}
+            className="px-3.5 py-1.5 rounded-lg bg-emerald-700/50 hover:bg-emerald-700/70 border border-emerald-400/30 text-emerald-200 text-xs font-semibold font-mono flex items-center gap-1.5 transition-all cursor-pointer shadow-sm"
+            title="Generate a reusable Page Object and workflow framework ZIP from the optimized recording"
+            id="generateFrameworkBtn"
           >
-            <span className="material-symbols-outlined text-[16px] text-[#adc6ff]">
-              auto_awesome
+            <span className="material-symbols-outlined text-[16px]">
+              {isGeneratingFramework ? 'progress_activity' : frameworkProject ? 'check_circle' : 'account_tree'}
             </span>
-            <span>Prepare for AI</span>
+            <span>
+              {isGeneratingFramework
+                ? 'Generating Framework...'
+                : frameworkProject
+                  ? 'Framework Generated ✓'
+                  : 'Generate Framework'}
+            </span>
           </button>
           <button
             onClick={handleExecuteClick}
@@ -645,15 +759,196 @@ ${
         </div>
       </div>
 
-      {/* Live Statistics: Total Steps, Clicks, Fills, Navigations, Session Duration */}
-      <div className="grid grid-cols-2 sm:grid-cols-5 gap-2.5">
+      {frameworkProject && (
+        <section
+          aria-label="Generated framework summary"
+          className="rounded-xl border border-emerald-400/30 bg-emerald-950/20 p-4 space-y-3"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h2 className="flex items-center gap-2 text-sm font-semibold text-emerald-300">
+                <span className="material-symbols-outlined text-[18px]">task_alt</span>
+                Framework Generated ✓
+              </h2>
+              <p className="mt-1 text-xs text-[#b7b6c5]">
+                Generated project contents, ready to download.
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              {frameworkProject && (
+                <button
+                  onClick={() => void saveFrameworkProject(frameworkProject).then(() => onToast?.('Framework project saved.', 'success')).catch((error: unknown) => onToast?.(error instanceof Error ? error.message : 'Failed to save framework project.', 'error'))}
+                  className="rounded border border-white/15 px-3 py-2 text-xs font-mono text-[#dfe2ee] hover:bg-white/5"
+                >
+                  Save Project
+                </button>
+              )}
+              <button
+                onClick={() => setIsFrameworkStructureOpen((open) => !open)}
+                aria-expanded={isFrameworkStructureOpen}
+                className="rounded-lg border border-emerald-300/30 px-3 py-2 text-xs font-mono text-emerald-200 hover:bg-emerald-400/10 transition-colors"
+              >
+                {isFrameworkStructureOpen ? 'Hide Structure' : 'View Structure'}
+              </button>
+              <button
+                onClick={handleDownloadFramework}
+                className="flex items-center gap-1.5 rounded-lg bg-emerald-600 px-3 py-2 text-xs font-semibold font-mono text-white hover:bg-emerald-500 transition-colors"
+              >
+                <span className="material-symbols-outlined text-[16px]">download</span>
+                Download ZIP
+              </button>
+            </div>
+          </div>
+
+          <dl className="grid grid-cols-2 gap-2 sm:grid-cols-3 xl:grid-cols-6">
+            {[
+              ['Generated files', frameworkProject.metadata.generatedFileCount],
+              ['Page Objects', frameworkProject.metadata.pageObjectCount],
+              ['Workflow functions', frameworkProject.metadata.workflowFunctionCount],
+              ['Tests', frameworkProject.metadata.testCount],
+              ['Test data files', frameworkProject.metadata.testDataFileCount],
+              ['Fixtures', frameworkProject.metadata.fixtureCount]
+            ].map(([label, count]) => (
+              <div key={label} className="rounded-lg border border-white/5 bg-[#181c24]/80 px-3 py-2">
+                <dt className="text-[10px] font-mono uppercase tracking-wide text-[#908fa0]">{label}</dt>
+                <dd className="mt-1 text-lg font-bold font-mono text-[#dfe2ee]">{count}</dd>
+              </div>
+            ))}
+          </dl>
+
+          {isFrameworkStructureOpen && (
+            <div className="max-h-64 overflow-auto rounded-lg border border-white/10 bg-[#101319] p-3">
+              <p className="mb-2 text-[10px] font-mono uppercase tracking-wider text-[#908fa0]">
+                playwright-framework/
+              </p>
+              <ul className="space-y-1">
+                {frameworkProject.metadata.files.map((filePath) => (
+                  <li
+                    key={filePath}
+                    className="font-mono text-xs text-[#c7c4d7]"
+                  >
+                    <span className="text-[#4cd7f6]">├── </span>
+                    {filePath}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {/* AI Framework Review — UI/state plumbing only in this phase.
+              No LLM integration yet, so this never shows fabricated
+              findings: it always reads "Pending" while a framework exists. */}
+          <div className="rounded-lg border border-white/10 bg-[#101319] p-3 flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2">
+              <span className="material-symbols-outlined text-[18px] text-[#c0c1ff]">rate_review</span>
+              <div>
+                <div className="text-xs font-semibold text-[#dfe2ee]">AI Framework Review</div>
+                <div className="text-[10px] text-[#908fa0]">
+                  Reviews Page Objects, workflows, locators, and data parameterization for quality and duplication.
+                </div>
+              </div>
+            </div>
+            <span className="px-2 py-1 rounded text-[10px] font-mono font-semibold uppercase bg-amber-500/15 text-amber-300 flex-shrink-0">
+              {frameworkReviewState?.status === 'pending' ? 'Pending — not yet reviewed' : 'Not available'}
+            </span>
+          </div>
+
+          {/* Validate Framework — the deterministic (non-LLM) structural/
+              build/type-safety gate. AI Test Generation only becomes ready
+              once this reports PASS for the current FrameworkProject. */}
+          <div className="rounded-lg border border-white/10 bg-[#101319] p-3 space-y-2">
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <span className="material-symbols-outlined text-[18px] text-[#4cd7f6]">verified</span>
+                <div>
+                  <div className="text-xs font-semibold text-[#dfe2ee]">Validate Framework</div>
+                  <div className="text-[10px] text-[#908fa0]">
+                    Deterministic structural/build/type-safety check (tsc --noEmit) — not an AI review.
+                  </div>
+                </div>
+              </div>
+              <div className="flex items-center gap-2 flex-shrink-0">
+                {frameworkValidationState && (
+                  <span
+                    className={`px-2 py-1 rounded text-[10px] font-mono font-semibold uppercase ${
+                      frameworkValidationState.status === 'passed'
+                        ? 'bg-emerald-500/20 text-emerald-400'
+                        : frameworkValidationState.status === 'failed'
+                          ? 'bg-red-500/20 text-red-400'
+                          : 'bg-amber-500/20 text-amber-300'
+                    }`}
+                  >
+                    {frameworkValidationState.status === 'running' ? 'Validating…' : frameworkValidationState.status}
+                  </span>
+                )}
+                <button
+                  onClick={handleValidateFramework}
+                  disabled={frameworkValidationState?.status === 'running'}
+                  className="px-3 py-1.5 rounded-lg bg-[#262a33] hover:bg-[#31353e] border border-[#4cd7f6]/30 text-[#4cd7f6] text-xs font-semibold font-mono flex items-center gap-1.5 transition-all cursor-pointer disabled:opacity-60"
+                  id="validateFrameworkBtn"
+                >
+                  <span className="material-symbols-outlined text-[15px]">
+                    {frameworkValidationState?.status === 'running' ? 'progress_activity' : 'play_arrow'}
+                  </span>
+                  <span>{frameworkValidationState ? 'Re-validate' : 'Validate Framework'}</span>
+                </button>
+              </div>
+            </div>
+
+            {frameworkValidationState?.status === 'failed' && (
+              <div className="rounded-lg border border-red-400/20 bg-red-950/20 p-2 space-y-1 max-h-40 overflow-auto">
+                {frameworkValidationState.error && (
+                  <div className="text-[11px] font-mono text-red-300">{frameworkValidationState.error}</div>
+                )}
+                {frameworkValidationState.diagnostics.map((diagnostic, i) => (
+                  <div key={i} className="text-[11px] font-mono text-red-300">
+                    {diagnostic.file}
+                    {diagnostic.line ? `:${diagnostic.line}` : ''}
+                    {diagnostic.code ? ` ${diagnostic.code}` : ''} — {diagnostic.message}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {frameworkValidationState?.status === 'passed' && (
+              <button
+                onClick={handleContinueToAITestGeneration}
+                className="w-full flex items-center justify-center gap-1.5 rounded-lg bg-[#c0c1ff] hover:bg-[#a9aaff] text-[#1000a9] text-xs font-semibold font-mono py-2 cursor-pointer transition-all"
+              >
+                <span>Continue to AI Test Generation</span>
+                <span className="material-symbols-outlined text-[16px]">arrow_forward</span>
+              </button>
+            )}
+          </div>
+        </section>
+      )}
+
+      {/* Live Statistics: recorded events, optimized steps, action breakdown, and duration */}
+      <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-6 gap-2.5">
         <div className="p-3 rounded-xl bg-[#181c24] border border-[#262a33]">
           <span className="text-[10px] font-mono text-[#908fa0] uppercase tracking-wider">
-            Total Steps
+            Recorded Events / Actions
           </span>
           <div className="text-xl font-bold font-mono text-[#dfe2ee] mt-1">
             {liveStats.totalSteps}
           </div>
+        </div>
+        <div className="p-3 rounded-xl bg-[#181c24] border border-[#262a33]">
+          <span className="text-[10px] font-mono text-[#908fa0] uppercase tracking-wider">
+            Optimized Steps
+          </span>
+          <div className="text-xl font-bold font-mono text-[#4cd7f6] mt-1">
+            {optimizedStepCount ?? '—'}
+          </div>
+          <span className="text-[10px] font-mono text-[#908fa0]">
+            {optimizedReductionPercent === null
+              ? 'Run Optimize to compare'
+              : optimizedReductionPercent > 0
+                ? `${optimizedReductionPercent}% fewer steps`
+                : optimizedReductionPercent < 0
+                  ? `${Math.abs(optimizedReductionPercent)}% more steps`
+                  : '0% reduction'}
+          </span>
         </div>
         <div className="p-3 rounded-xl bg-[#181c24] border border-[#262a33]">
           <span className="text-[10px] font-mono text-[#908fa0] uppercase tracking-wider">

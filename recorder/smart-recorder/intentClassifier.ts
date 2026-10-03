@@ -42,8 +42,18 @@ const RULES: Rule[] = [
   },
   {
     intent: 'UpdateRecord',
-    signal: 'click:text~update',
-    matches: (e) => e.type === 'click' && /\bupdate\b/.test(textOf(e))
+    // Root cause of Workflow Matcher NOT_MATCHED on a real recording
+    // whose own save action is labeled "Save", not "Update": confirmed
+    // live — a real ServiceNow Classic incident form's save button reads
+    // "Save", and no rule here recognized it, so the whole session never
+    // crossed a WORKFLOW_BOUNDARIES intent (frameworkGenerator.ts) and
+    // collapsed into one unnamed "runCapturedActions" workflow instead of
+    // "updateIncident" — Workflow Matcher had nothing to match against,
+    // regardless of which field was actually changed. "Save" on an
+    // already-open record is an update completion the same way "Update"
+    // is; generic across any app, not ServiceNow- or field-specific.
+    signal: 'click:text~update-or-save',
+    matches: (e) => e.type === 'click' && /\b(?:update|save)\b/.test(textOf(e))
   },
   {
     intent: 'SubmitRecord',

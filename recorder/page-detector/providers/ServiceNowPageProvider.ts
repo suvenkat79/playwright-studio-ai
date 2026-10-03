@@ -8,6 +8,27 @@ function includesAny(haystack: readonly string[], needles: string[]): boolean {
   });
 }
 
+function routeEvidence(facts: BrowserFacts): string {
+  const frameSources: string[] = [];
+  const collectFrameSources = (frames: BrowserFacts['iframeHierarchy']) => {
+    for (const frame of frames) {
+      frameSources.push(frame.src);
+      collectFrameSources(frame.children);
+    }
+  };
+  collectFrameSources(facts.iframeHierarchy);
+  return [facts.href, facts.pathname, ...frameSources, ...facts.frameUrls]
+    .map((route) => {
+      try {
+        return decodeURIComponent(route);
+      } catch {
+        return route;
+      }
+    })
+    .join(' ')
+    .toLowerCase();
+}
+
 interface PageCandidate {
   pageType: string;
   module: string | null;
@@ -154,13 +175,13 @@ export class ServiceNowPageProvider implements PageDetector {
     const fired: string[] = [];
     let score = 0;
     const maxScore = 9; // sys_id:4, record-target:4, incident-non-list:1
-    const pathLower = facts.pathname.toLowerCase();
+    const routeText = routeEvidence(facts);
 
-    if (pathLower.includes('sys_id')) {
+    if (/\bsys_id\s*=/.test(routeText)) {
       score += 4;
       fired.push('url:sys_id-present');
     }
-    if (pathLower.includes('sysparm_record_target') && pathLower.includes('incident')) {
+    if (/sysparm_record_target\s*=\s*incident/.test(routeText)) {
       score += 4;
       fired.push('url:record-target-incident');
     }
@@ -171,7 +192,7 @@ export class ServiceNowPageProvider implements PageDetector {
     // confidence before being caught). "incident_list" is the actual list
     // route name (see detectIncidentList above), so check for its absence
     // specifically, not any occurrence of the substring "list".
-    if (pathLower.includes('incident') && !pathLower.includes('incident_list')) {
+    if (routeText.includes('incident') && !routeText.includes('incident_list')) {
       score += 1;
       fired.push('url:incident-non-list');
     }

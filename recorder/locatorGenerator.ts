@@ -200,7 +200,7 @@ export const browserInjectionScript = `
       if (labelEl && labelEl.innerText.trim()) return labelEl.innerText.trim().replace(/\\s+/g, ' ');
     }
 
-    if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+    if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT') {
       if (el.id) {
         const label = document.querySelector('label[for="' + CSS.escape(el.id) + '"]');
         if (label && label.innerText.trim()) return label.innerText.trim().replace(/\\s+/g, ' ');
@@ -672,6 +672,66 @@ export const browserInjectionScript = `
       cssSelector: cssSelector
     };
   }
+
+  // AI Gen's natural-language -> real-element resolution. Deliberately NOT
+  // a second locator engine: this only finds WHICH element a phrase like
+  // "Priority" refers to (a new responsibility) and then hands that exact
+  // element to the same computePlaywrightLocator() the Recorder already
+  // uses for every click/fill it captures -- so AI Gen inherits the exact
+  // same ambiguous-name disambiguation, identity anchoring, and shadow-DOM
+  // handling already proven live, for free. Matching is deliberately
+  // simple and deterministic (exact accessible-name match preferred, then
+  // substring) -- no fuzzy/ML matching, consistent with not claiming AI
+  // capability that isn't actually there. tagFilter narrows candidates to
+  // a CSS selector list (e.g. 'input, select, textarea' for a "set field"
+  // intent) when the caller already knows what kind of element it wants;
+  // omitted, it searches the same INTERACTIVE_SELECTOR set the recorder's
+  // own click listener resolves ancestors against.
+  function resolveElementByText(searchText, tagFilter) {
+    if (!searchText) return null;
+    const normalizedSearch = searchText.trim().toLowerCase();
+    if (!normalizedSearch) return null;
+
+    // Excludes bare <label> from the default candidate set (unlike
+    // INTERACTIVE_SELECTOR, which includes it for the click-recorder's
+    // different job of resolving a real click target). A label's own text
+    // is "Priority" too, so without this a <label> can tie with -- and by
+    // document order beat -- the <select> it actually labels, resolving
+    // to the label itself (computePlaywrightLocator has no good strategy
+    // for a bare label, since clicking it isn't a meaningful field
+    // resolution). getAccessibleName() on the real control already
+    // resolves its associated label text, so nothing is lost by excluding
+    // labels here.
+    const candidateSelector = tagFilter || INTERACTIVE_SELECTOR.replace(/,\\s*label$/, '');
+    const candidates = Array.from(document.querySelectorAll(candidateSelector)).filter((el) => {
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    });
+
+    let bestMatch = null;
+    let bestScore = 0; // 2 = exact accessible-name match, 1 = substring match
+    for (const el of candidates) {
+      const name = getAccessibleName(el);
+      if (!name) continue;
+      const normalizedName = name.trim().toLowerCase();
+      let score = 0;
+      if (normalizedName === normalizedSearch) {
+        score = 2;
+      } else if (normalizedName.includes(normalizedSearch) || normalizedSearch.includes(normalizedName)) {
+        score = 1;
+      }
+      if (score > bestScore) {
+        bestScore = score;
+        bestMatch = el;
+      }
+    }
+
+    if (!bestMatch) return null;
+    const loc = computePlaywrightLocator(bestMatch);
+    return Object.assign({ matchedText: getAccessibleName(bestMatch) }, loc);
+  }
+
+  window.__playwrightStudioResolveElement = resolveElementByText;
 
   // Sprint 5.4: spreads a computePlaywrightLocator() result's structured
   // fields into an emit payload, additive alongside the existing selector/

@@ -9,7 +9,7 @@ import { BrowserFacts } from './types';
  * exactly one place, per the locked architecture.
  */
 export async function extractBrowserFacts(page: Page): Promise<BrowserFacts> {
-  return page.evaluate(() => {
+  const facts = await page.evaluate(() => {
     const metaTags: Record<string, string> = {};
     document.querySelectorAll('meta[name], meta[property]').forEach((meta) => {
       const key = meta.getAttribute('name') || meta.getAttribute('property');
@@ -17,7 +17,41 @@ export async function extractBrowserFacts(page: Page): Promise<BrowserFacts> {
       if (key && content) metaTags[key] = content;
     });
 
-    const iframes = Array.from(document.querySelectorAll('iframe'));
+    // Shadow-DOM-piercing iframe search (root-cause fix: a real ServiceNow
+    // Now Experience instance renders its Classic-compat content frame
+    // inside a custom element's shadow root, with the "gsft_main" id
+    // placed on the light-DOM WRAPPER custom element, not on the actual
+    // <iframe> tag itself. document.querySelectorAll('iframe') never
+    // descends into shadow roots, so it found zero iframes at all here,
+    // even though document.getElementById('gsft_main') correctly found
+    // the wrapper (confirmed live: hasGsftMainFrame/rootContainerIds below
+    // correctly saw "gsft_main", while the plain iframe query came back
+    // completely empty for the exact same page). Playwright's own Frame
+    // API (page.frames(), used for BrowserFacts.frameUrls below, and
+    // engine.ts's getFrameSelector()) tracks frames at the browser/CDP
+    // level and is unaffected by this — only this DOM-query-based
+    // collection was blind to it.
+    const collectIframesDeep = (root: Element): HTMLIFrameElement[] => {
+      const found: HTMLIFrameElement[] = [];
+      const stack: Element[] = [root];
+      while (stack.length > 0) {
+        const node = stack.pop()!;
+        for (const child of Array.from(node.children)) {
+          if (child.tagName === 'IFRAME') found.push(child as HTMLIFrameElement);
+          stack.push(child);
+        }
+        const shadowRoot = (node as Element & { shadowRoot?: ShadowRoot | null }).shadowRoot;
+        if (shadowRoot) {
+          for (const child of Array.from(shadowRoot.children)) {
+            if (child.tagName === 'IFRAME') found.push(child as HTMLIFrameElement);
+            stack.push(child);
+          }
+        }
+      }
+      return found;
+    };
+
+    const iframes = collectIframesDeep(document.documentElement);
 
     // Custom-element tag names (e.g. <macroponent-f51912...>,
     // <lightning-button>) can't be matched with a CSS attribute selector —
@@ -113,8 +147,8 @@ export async function extractBrowserFacts(page: Page): Promise<BrowserFacts> {
       let children: IframeNode[] = [];
       try {
         const doc = el.contentDocument;
-        if (doc) {
-          children = Array.from(doc.querySelectorAll('iframe')).map((child, i) => extractIframeNode(child as HTMLIFrameElement, i));
+        if (doc && doc.documentElement) {
+          children = collectIframesDeep(doc.documentElement).map((child, i) => extractIframeNode(child, i));
         }
       } catch {
         // Cross-origin — inaccessible from here, children stays empty.
@@ -152,4 +186,9 @@ export async function extractBrowserFacts(page: Page): Promise<BrowserFacts> {
       hasTableOrGridElement
     };
   });
+
+  return {
+    ...facts,
+    frameUrls: page.frames().map((frame) => frame.url())
+  };
 }

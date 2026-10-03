@@ -21,6 +21,7 @@ public class RecordingSession {
     private final List<RecordedActionDto> events = Collections.synchronizedList(new ArrayList<>());
     private volatile String generatedTestScript = "";
     private volatile String failureReason;
+    private volatile String browserStorageStateJson;
 
     public RecordingSession(String sessionId, String targetUrl) {
         this.sessionId = sessionId;
@@ -95,5 +96,13 @@ public class RecordingSession {
 
     public void setFailureReason(String failureReason) {
         this.failureReason = failureReason;
+    }
+
+    public String getBrowserStorageStateJson() {
+        return browserStorageStateJson;
+    }
+
+    public void setBrowserStorageStateJson(String browserStorageStateJson) {
+        this.browserStorageStateJson = browserStorageStateJson;
     }
 }

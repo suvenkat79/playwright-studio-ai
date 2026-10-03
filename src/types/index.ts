@@ -56,6 +56,50 @@ export interface RecordedAction {
   variableName?: string;
   identitySelector?: string;
   tabIndex?: number;
+  applicationMetadata?: {
+    application: string;
+    ui?: string;
+    confidence: number;
+    instance?: string;
+    signals: string[];
+  };
+  pageMetadata?: {
+    pageType: string;
+    module: string | null;
+    entity: string | null;
+    confidence: number;
+    signals: string[];
+  };
+  frameMetadata?: {
+    frameType: 'MainFrame' | 'NestedFrame';
+    frameSelector: string | null;
+    framePath: string[];
+    confidence: number;
+    signals: string[];
+  };
+  smartLocator?: {
+    strategy: string;
+    tag: string;
+    role?: string;
+    text?: string;
+    label?: string;
+    placeholder?: string;
+    testId?: string;
+    id?: string;
+    cssSelector?: string;
+    frameSelector?: string;
+  };
+  intent?: {
+    eventId: string;
+    intent: string;
+    confidence: number;
+    signals: string[];
+  };
+  navigation?: {
+    fromUrl: string;
+    toUrl: string;
+    trigger: 'click' | 'submit' | 'redirect';
+  };
 }
 
 export interface DiagnosticsSummary {
@@ -74,6 +118,21 @@ export interface StartRecordingResponse {
   status: 'RECORDING_STARTED' | string;
   sessionId: string;
   targetUrl?: string;
+}
+
+export interface StartResolutionSessionRequest {
+  url: string;
+  sourceSessionId?: string;
+}
+
+export interface StartResolutionSessionResponse {
+  status: 'RESOLUTION_STARTED' | string;
+  sessionId: string;
+  targetUrl: string;
+}
+
+export interface CloseResolutionSessionRequest {
+  sessionId: string;
 }
 
 export interface StopRecordingRequest {
@@ -103,6 +162,24 @@ export interface SessionStatusResponse {
   targetUrl: string;
   startedAt?: string;
   failureReason?: string | null;
+}
+
+// --- AI Gen: natural-language -> live-DOM intent resolution ---
+
+export interface ResolveIntentRequest {
+  sessionId: string;
+  instruction: string;
+}
+
+/** `actions` is the exact RecordedAction shape the Recorder's own live
+ * capture produces — AI Gen feeds it straight into the existing optimizer/
+ * spec-generator pipeline unchanged. `unresolved` is the raw text of every
+ * clause AI Gen could not parse or could not match to a real element on
+ * the live page, so the caller can show that honestly instead of guessing. */
+export interface ResolveIntentResponse {
+  sessionId: string;
+  actions: RecordedAction[];
+  unresolved: string[];
 }
 
 export interface ToastNotification {

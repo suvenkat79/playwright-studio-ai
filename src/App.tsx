@@ -3,7 +3,6 @@ import { Header } from './components/Header';
 import { ProjectHeader } from './components/ProjectHeader';
 import { CategoryTabs } from './components/CategoryTabs';
 import { CodeViewer } from './components/CodeViewer';
-import { FrameworkDiagnostics } from './components/FrameworkDiagnostics';
 import { LiveTraceAttachment } from './components/LiveTraceAttachment';
 import { StickyActionBar } from './components/StickyActionBar';
 import { BottomNavBar } from './components/BottomNavBar';
@@ -228,9 +227,8 @@ export default function App() {
                 />
               </div>
 
-              {/* Right column: Framework Diagnostics & Live Trace Attachment */}
+              {/* Right column: Live Trace Attachment */}
               <div className="lg:col-span-4 flex flex-col gap-4">
-                <FrameworkDiagnostics />
                 <LiveTraceAttachment
                   onOpenSandbox={() => handleOpenSandboxWithUrl(targetBaseUrl)}
                 />
@@ -270,7 +268,7 @@ export default function App() {
 
         {/* View 3: AI Test & POM Generator */}
         {activeNavTab === 'ai-gen' && (
-          <AIGeneratorView onAddGeneratedFile={handleAddGeneratedFile} />
+          <AIGeneratorView onToast={showToast} />
         )}
 
         {/* View 4: Suite Quality & Telemetry Dashboard */}
@@ -291,6 +289,7 @@ export default function App() {
         initialUrl={sandboxInitialUrl}
         initialHeadless={isHeadless}
         suiteFiles={suiteFiles}
+        preferredSpecId={activeFileId}
       />
 
       {/* Persistent Bottom Mobile Navigation Bar */}

@@ -92,6 +92,9 @@ export interface BrowserFacts {
   readonly iframeSrcs: readonly string[];
   /** Flat, top-level iframe `name` attributes (Sprint 5 Phase 3). */
   readonly iframeNames: readonly string[];
+  /** Current Playwright frame URLs, including redirects/history updates
+   * that do not update an iframe element's src attribute. */
+  readonly frameUrls: readonly string[];
   /** Recursive iframe tree, roots = top-level iframes (Sprint 5 Phase 3).
    * Same-origin nested iframes are walked recursively within this same
    * evaluate() call; a cross-origin iframe's `children` is always empty —
@@ -157,6 +160,14 @@ export interface RecordedBrowserEvent {
    * the generic pattern first," while still degrading to the generic
    * selector if that specific record is gone by replay time. */
   identitySelector?: string;
+  /** Smart Recorder facts captured for this same browser event. These are
+   * additive metadata; they do not alter the recorded selector or action. */
+  applicationMetadata?: ApplicationMetadata;
+  pageMetadata?: PageMetadata;
+  frameMetadata?: FrameMetadata;
+  smartLocator?: import('./smart-recorder/types').LocatorMetadata;
+  intent?: IntentEntry;
+  navigation?: import('./smart-recorder/types').NavigationMetadata;
   /** 0 for the original recording tab, 1/2/... for each subsequent tab or
    * popup the browser context opens (a target="_blank" link, window.open())
    * — assigned in open order. Lets replay know it needs to switch to a
@@ -175,6 +186,13 @@ export interface RecordingSession {
   page: any;
   events: RecordedBrowserEvent[];
   isActive: boolean;
+  /** Undefined (the default) for every session startSession() creates — a
+   * real recording. 'resolution' marks a session PlaywrightRecordingEngine
+   * .startResolutionSession() created instead: a short-lived, non-recording
+   * browser for GenAI's live-DOM resolution (no human-interaction capture,
+   * no Smart Recorder). Lets startResolutionSession() detect "is a real
+   * recording currently active" without a second session map. */
+  kind?: 'resolution';
   /** Captured once, immediately after initial page load, and never again
    * — see engine.ts's detectApplication(). Optional so existing session
    * objects (and anything constructing one without it) remain valid. */
